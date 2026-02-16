@@ -1,0 +1,134 @@
+/*
+ * X Offline Enhancer - Content Script Styles
+ * Buttons injected into tweet action bars.
+ */
+
+/* ── Container ──────────────────────────────────────────── */
+
+.xoe-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+  flex-shrink: 0;
+}
+
+/* ── Base Button ────────────────────────────────────────── */
+
+.xoe-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 12px;
+  height: 30px;
+  border: 1.5px solid rgba(29, 155, 240, 0.4);
+  border-radius: 9999px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+  white-space: nowrap;
+  background-color: transparent;
+  color: rgb(29, 155, 240);
+}
+
+.xoe-btn:hover {
+  background-color: rgba(29, 155, 240, 0.12);
+  border-color: rgba(29, 155, 240, 0.7);
+}
+
+.xoe-btn:active {
+  transform: scale(0.95);
+}
+
+.xoe-btn:focus-visible {
+  outline: 2px solid rgb(29, 155, 240);
+  outline-offset: 2px;
+}
+
+.xoe-btn-icon {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.xoe-btn-label {
+  display: inline-block;
+}
+
+/* ── Save Button States ─────────────────────────────────── */
+
+.xoe-save-btn {
+  color: rgb(29, 155, 240);
+  border-color: rgba(29, 155, 240, 0.4);
+}
+
+.xoe-save-btn:hover {
+  background-color: rgba(29, 155, 240, 0.12);
+  color: rgb(29, 155, 240);
+  border-color: rgba(29, 155, 240, 0.7);
+}
+
+/* Saving (animated) */
+.xoe-save-btn.xoe-saving {
+  color: rgb(29, 155, 240);
+  border-color: rgba(29, 155, 240, 0.5);
+  opacity: 0.8;
+  pointer-events: none;
+  animation: xoe-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes xoe-pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
+/* Saved */
+.xoe-save-btn.xoe-saved {
+  color: rgb(0, 186, 124);
+  border-color: rgba(0, 186, 124, 0.4);
+  pointer-events: none;
+}
+
+/* ── PiP Button ─────────────────────────────────────────── */
+
+.xoe-pip-btn {
+  color: rgb(120, 86, 255);
+  border-color: rgba(120, 86, 255, 0.4);
+}
+
+.xoe-pip-btn:hover {
+  background-color: rgba(120, 86, 255, 0.12);
+  color: rgb(120, 86, 255);
+  border-color: rgba(120, 86, 255, 0.7);
+}
+
+/* ── Dark Mode ──────────────────────────────────────────── */
+
+/* X Dark (Dim: #15202b / LightsOut: #000) - detected via body background */
+@media (prefers-color-scheme: dark) {
+  .xoe-save-btn {
+    color: rgb(29, 155, 240);
+    border-color: rgba(29, 155, 240, 0.35);
+  }
+  .xoe-save-btn:hover {
+    background-color: rgba(29, 155, 240, 0.15);
+    border-color: rgba(29, 155, 240, 0.6);
+  }
+  .xoe-save-btn.xoe-saved {
+    color: rgb(0, 186, 124);
+    border-color: rgba(0, 186, 124, 0.35);
+  }
+  .xoe-pip-btn {
+    color: rgb(120, 86, 255);
+    border-color: rgba(120, 86, 255, 0.35);
+  }
+  .xoe-pip-btn:hover {
+    background-color: rgba(120, 86, 255, 0.15);
+    border-color: rgba(120, 86, 255, 0.6);
+  }
+}

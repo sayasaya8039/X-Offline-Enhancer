@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>X Offline Enhancer</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <!-- Header -->
+  <header id="header">
+    <div class="header-top" id="header-normal">
+      <h1 class="header-title">X Offline Enhancer</h1>
+      <div class="header-actions">
+        <button id="btn-select-mode" class="btn-icon" title="選択モード">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="9 11 12 14 22 4"></polyline>
+            <path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"></path>
+          </svg>
+        </button>
+        <button id="btn-settings" class="btn-icon" title="設定">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"></path>
+          </svg>
+        </button>
+        <button id="btn-delete-all" class="btn-icon" title="すべて削除">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="3 6 5 6 21 6"></polyline>
+            <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"></path>
+          </svg>
+        </button>
+      </div>
+    </div>
+    <div class="header-top selection-bar" id="header-selection" style="display:none;">
+      <div class="selection-info">
+        <button id="btn-cancel-select" class="btn-icon" title="キャンセル">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+        <span id="selection-count">0件選択</span>
+      </div>
+      <div class="selection-actions">
+        <button id="btn-select-all" class="btn-secondary">全選択</button>
+        <button id="btn-delete-selected" class="btn-danger" disabled>削除</button>
+      </div>
+    </div>
+    <div class="search-container">
+      <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="11" cy="11" r="8"></circle>
+        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+      </svg>
+      <input type="text" id="search-input" placeholder="スレッドを検索..." autocomplete="off">
+    </div>
+    <div class="storage-bar">
+      <div class="storage-info">
+        <span id="storage-text">0MB / 0MB</span>
+      </div>
+      <div class="storage-progress">
+        <div id="storage-fill" class="storage-fill"></div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Settings Panel -->
+  <div id="settings-panel" class="settings-panel" style="display:none;">
+    <div class="settings-body">
+      <div class="setting-row">
+        <label for="cache-limit">データ使用量上限</label>
+        <select id="cache-limit">
+          <option value="100">100MB</option>
+          <option value="200">200MB</option>
+          <option value="500">500MB</option>
+          <option value="0">無制限</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <label for="cache-ttl">画像キャッシュ自動削除</label>
+        <select id="cache-ttl">
+          <option value="7">7日後</option>
+          <option value="30">30日後</option>
+          <option value="90">90日後</option>
+          <option value="0">無期限</option>
+        </select>
+      </div>
+      <div class="setting-row setting-action">
+        <button id="btn-manual-cleanup" class="btn-secondary">今すぐクリーンアップ</button>
+        <span id="cleanup-status" class="cleanup-status"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Thread List View -->
+  <main id="thread-list-view">
+    <div id="thread-list" class="thread-list"></div>
+    <div id="empty-state" class="empty-state">
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#536471" stroke-width="1.5">
+        <path d="M19 21l-7-5-7 5V5a2 2 0 012-2h10a2 2 0 012 2z"></path>
+      </svg>
+      <p>まだ保存されたスレッドがありません</p>
+      <span class="empty-hint">X/Twitterでスレッドを開き、保存ボタンをクリックしてください</span>
+    </div>
+  </main>
+
+  <!-- Reader View -->
+  <div id="reader-view" class="reader-view" style="display:none;">
+    <div class="reader-header">
+      <button id="btn-back" class="btn-icon" title="戻る">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="19" y1="12" x2="5" y2="12"></line>
+          <polyline points="12 19 5 12 12 5"></polyline>
+        </svg>
+      </button>
+      <div class="reader-actions">
+        <button id="btn-export-pdf" class="btn-secondary" title="PDFエクスポート">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+            <line x1="12" y1="18" x2="12" y2="12"></line>
+            <polyline points="9 15 12 18 15 15"></polyline>
+          </svg>
+          PDF
+        </button>
+        <button id="btn-delete-thread" class="btn-danger" title="削除">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="3 6 5 6 21 6"></polyline>
+            <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"></path>
+          </svg>
+          削除
+        </button>
+      </div>
+    </div>
+    <article id="reader-content" class="reader-content"></article>
+  </div>
+
+  <!-- PDF Download Toast -->
+  <div id="pdf-toast" class="toast" style="display:none;">
+    <span id="pdf-toast-label">PDF生成完了</span>
+    <a id="pdf-download-link" href="#" download>ダウンロード</a>
+  </div>
+
+  <script src="sidepanel-init.js"></script>
+  <script type="module" src="sidepanel.js"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "jspdf": {
+    "version": "2.5.2",
+    "file": "jspdf.umd.min.js",
+    "license": "MIT",
+    "source": "https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js",
+    "downloaded": "2026-02-17"
+  },
+  "html2canvas": {
+    "version": "1.4.1",
+    "file": "html2canvas.min.js",
+    "license": "MIT",
+    "source": "https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js",
+    "downloaded": "2026-02-17"
+  }
+}
