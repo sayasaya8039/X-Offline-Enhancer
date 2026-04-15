@@ -350,6 +350,11 @@ body {
   border-radius: 10px;
 }
 
+.card-tag-warning {
+  color: #ffd400;
+  background: rgba(255, 212, 0, 0.12);
+}
+
 .card-delete {
   display: flex;
   align-items: center;
@@ -480,6 +485,26 @@ body {
   font-size: 13px;
   color: var(--text-hint);
   margin-top: 2px;
+}
+
+.reader-integrity {
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.reader-integrity-warning {
+  color: #ffd400;
+  background: rgba(255, 212, 0, 0.08);
+  border: 1px solid rgba(255, 212, 0, 0.18);
+}
+
+.reader-integrity-error {
+  color: #ff8e8e;
+  background: rgba(244, 33, 46, 0.08);
+  border: 1px solid rgba(244, 33, 46, 0.18);
 }
 
 /* Reader: Tweet Block */

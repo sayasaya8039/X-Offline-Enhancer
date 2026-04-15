@@ -40,12 +40,62 @@
     return null;
   }
 
+  function normalizeTweetText(value) {
+    return String(value ?? '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\u00a0/g, ' ')
+      .split('\n')
+      .map((line) => line.replace(/[ \t]+$/g, ''))
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function extractTweetText(articleEl) {
+    const textEl = articleEl.querySelector('[data-testid="tweetText"]');
+    if (textEl) {
+      return {
+        text: normalizeTweetText(textEl.innerText || textEl.textContent || ''),
+        textSource: 'tweetText'
+      };
+    }
+
+    const langNodes = articleEl.querySelectorAll('div[lang]');
+    const textParts = [...langNodes]
+      .map((node) => normalizeTweetText(node.innerText || node.textContent || ''))
+      .filter(Boolean);
+
+    if (textParts.length > 0) {
+      return {
+        text: [...new Set(textParts)].join('\n'),
+        textSource: 'lang'
+      };
+    }
+
+    return { text: '', textSource: 'missing' };
+  }
+
+  function tweetHasMedia(tweet) {
+    return (Array.isArray(tweet?.images) && tweet.images.length > 0) || Boolean(tweet?.hasVideo);
+  }
+
+  function tweetHasContent(tweet) {
+    return normalizeTweetText(tweet?.text).length > 0 || tweetHasMedia(tweet);
+  }
+
+  function normalizeHandle(tweet) {
+    return String(tweet?.author?.handle || '').trim().toLowerCase();
+  }
+
+  function isThreadDetailPage() {
+    return /\/status\/\d+/.test(location.pathname);
+  }
+
   function extractTweetData(articleEl) {
     const id = extractTweetId(articleEl);
     if (!id) return null;
 
-    const textEl = articleEl.querySelector('[data-testid="tweetText"]');
-    const text = textEl ? textEl.innerText : '';
+    const { text, textSource } = extractTweetText(articleEl);
 
     let name = '', handle = '';
     const userNameEl = articleEl.querySelector('[data-testid="User-Name"]');
@@ -75,7 +125,7 @@
     const hasVideo = !!(articleEl.querySelector('video') || articleEl.querySelector('[data-testid="videoPlayer"]'));
     const videoUrl = hasVideo ? findVideoUrlForArticle(articleEl) : null;
 
-    return { id, text, author: { name, handle, avatarUrl }, timestamp, images, hasVideo, videoUrl };
+    return { id, text, textSource, author: { name, handle, avatarUrl }, timestamp, images, hasVideo, videoUrl };
   }
 
   function findVideoUrlForArticle(articleEl) {
@@ -111,34 +161,69 @@
       } catch {}
     }
 
-    // Method 3: Fallback — any video.twimg.com MP4 from performance entries
-    try {
-      const entries = performance.getEntriesByType('resource');
-      for (const entry of entries) {
-        if (entry.name.includes('video.twimg.com') && entry.name.includes('.mp4')) {
-          return entry.name;
-        }
-      }
-    } catch {}
-
     return null;
   }
 
-  function collectThreadTweets() {
-    let articles = document.querySelectorAll('article[data-testid="tweet"]');
-    if (articles.length === 0) {
-      articles = document.querySelectorAll('article[role="article"]');
+  function selectThreadTweets(candidates, clickedTweetId, options = {}) {
+    const clickedIndex = candidates.findIndex((tweet) => tweet.id === clickedTweetId);
+    if (clickedIndex < 0) return [];
+
+    const clickedTweet = candidates[clickedIndex];
+    if (options.isThreadView === false) return [clickedTweet];
+
+    const clickedHandle = normalizeHandle(clickedTweet);
+    if (!clickedHandle) return [clickedTweet];
+
+    let start = clickedIndex;
+    let end = clickedIndex;
+
+    while (start > 0) {
+      const prevTweet = candidates[start - 1];
+      if (normalizeHandle(prevTweet) !== clickedHandle || !tweetHasContent(prevTweet)) break;
+      start--;
     }
-    const tweets = [];
+
+    while (end < candidates.length - 1) {
+      const nextTweet = candidates[end + 1];
+      if (normalizeHandle(nextTweet) !== clickedHandle || !tweetHasContent(nextTweet)) break;
+      end++;
+    }
+
+    return candidates.slice(start, end + 1);
+  }
+
+  function collectThreadTweets(rootArticle) {
+    const clickedTweetId = extractTweetId(rootArticle);
+    if (!clickedTweetId) return [];
+
+    const scopeRoot = rootArticle.closest('[data-testid="primaryColumn"]')
+      || rootArticle.closest('[data-testid="cellInnerDiv"]')?.parentElement?.parentElement
+      || document.querySelector('[data-testid="primaryColumn"]')
+      || document.querySelector('[data-testid="DeckColumns"]')
+      || document.querySelector('main')
+      || document.body;
+
+    let articles = scopeRoot.querySelectorAll('article[data-testid="tweet"]');
+    if (articles.length === 0) {
+      articles = scopeRoot.querySelectorAll('article[role="article"]');
+    }
+    const candidates = [];
     const seen = new Set();
     for (const article of articles) {
       const data = extractTweetData(article);
       if (data && !seen.has(data.id)) {
         seen.add(data.id);
-        tweets.push(data);
+        candidates.push(data);
       }
     }
-    return tweets;
+
+    const selected = selectThreadTweets(candidates, clickedTweetId, {
+      isThreadView: isThreadDetailPage()
+    });
+    if (selected.length > 0) return selected;
+
+    const clickedTweet = candidates.find((tweet) => tweet.id === clickedTweetId);
+    return clickedTweet ? [clickedTweet] : [];
   }
 
   async function fetchImageAsBase64(url) {
@@ -189,8 +274,11 @@
     btn.disabled = true;
 
     try {
-      const tweets = collectThreadTweets();
+      const tweets = collectThreadTweets(articleEl);
       if (tweets.length === 0) throw new Error('No tweets found');
+      if (!tweets.some((tweet) => tweet.id === tweetId)) {
+        throw new Error('Clicked tweet missing from collected thread');
+      }
 
       log('Saving thread:', tweetId, 'tweets:', tweets.length);
 

@@ -4,6 +4,7 @@
 
 window.__xoeModuleLoaded = true;
 
+import { getIntegrityMessage, pickPrimaryTweet } from './lib/thread-model.mjs';
 import { isAllowedImageUrl } from './lib/utils-esm.js';
 import {
   getAllThreadsMeta, getThread, deleteThread, deleteAllThreads,
@@ -114,6 +115,26 @@ function debounce(fn, ms) {
   };
 }
 
+function appendIntegrityBadge(container, integrity) {
+  if (!integrity || integrity.status !== 'partial') return;
+  const badge = document.createElement('span');
+  badge.className = 'card-tag card-tag-warning';
+  badge.textContent = '不完全保存';
+  container.appendChild(badge);
+}
+
+function renderIntegrityNotice(parent, integrity) {
+  const message = getIntegrityMessage(integrity);
+  if (!message) return;
+
+  const notice = document.createElement('div');
+  notice.className = integrity?.status === 'invalid'
+    ? 'reader-integrity reader-integrity-error'
+    : 'reader-integrity reader-integrity-warning';
+  notice.textContent = message;
+  parent.appendChild(notice);
+}
+
 // ─── Confirm Dialog (XSS-safe: DOM API only) ───────────────
 
 function showConfirm(title, message) {
@@ -216,6 +237,9 @@ async function onManualCleanup() {
     cleanupStatus.textContent = totalPurged > 0
       ? `${totalPurged}件の画像キャッシュを削除しました`
       : 'クリーンアップ不要です';
+    if (currentView === 'list') {
+      loadThreadList(searchInput.value.trim());
+    }
     updateStorageDisplay();
   } catch (err) {
     console.error('[XOE] Manual cleanup error:', err);
@@ -333,7 +357,7 @@ async function loadThreadList(query) {
     card.style.animationDelay = `${Math.min(i * 0.04, 0.5)}s`;
     card.dataset.threadId = thread.id;
 
-    const firstTweet = thread.tweets?.[0];
+    const firstTweet = pickPrimaryTweet(thread);
     const author = firstTweet?.author || {};
 
     const avatarDiv = document.createElement('div');
@@ -379,6 +403,7 @@ async function loadThreadList(query) {
       tagSpan.textContent = t;
       tagsDiv.appendChild(tagSpan);
     });
+    appendIntegrityBadge(tagsDiv, thread.integrity);
 
     const deleteBtn = document.createElement('button');
     deleteBtn.className = 'card-delete';
@@ -430,7 +455,7 @@ async function openReaderView(threadId) {
     console.error('[XOE] Video load error:', err);
   }
 
-  const firstTweet = thread.tweets?.[0];
+  const firstTweet = pickPrimaryTweet(thread);
   const author = firstTweet?.author || {};
   const cache = thread.imageCache || {};
   const avatarSrc = cache[author.avatarUrl] || author.avatarUrl || '';
@@ -461,6 +486,7 @@ async function openReaderView(threadId) {
   infoDiv.append(nameSpan, handleSpan, dateSpan);
   authorDiv.append(avatarDiv, infoDiv);
   readerContent.appendChild(authorDiv);
+  renderIntegrityNotice(readerContent, thread.integrity);
 
   if (thread.tweets && thread.tweets.length > 0) {
     thread.tweets.forEach(tweet => {

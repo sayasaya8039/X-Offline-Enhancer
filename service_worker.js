@@ -9,6 +9,7 @@ import {
   purgeExpiredCaches, purgeUntilUnderLimit,
   addVideoBlob, deleteVideosByThread, deleteAllVideos
 } from './lib/db-esm.js';
+import { validateThreadForStorage } from './lib/thread-model.mjs';
 import { logSW } from './lib/utils-esm.js';
 
 console.log('[XOE-SW] Service worker loaded');
@@ -39,14 +40,14 @@ async function runCacheCleanup() {
   if (settings.cacheTTLDays > 0) {
     const r = await purgeExpiredCaches(settings.cacheTTLDays);
     totalPurged += r.purged;
-    if (r.purged > 0) console.log('[XOE-SW] Purged expired:', r.purged, 'threads');
+    if (r.purged > 0) console.log('[XOE-SW] Purged expired image caches for:', r.purged, 'thread records');
   }
 
   if (settings.cacheLimitMB > 0) {
     const limitBytes = settings.cacheLimitMB * 1024 * 1024;
     const r = await purgeUntilUnderLimit(limitBytes);
     totalPurged += r.purged;
-    if (r.purged > 0) console.log('[XOE-SW] Purged over-limit:', r.purged, 'threads');
+    if (r.purged > 0) console.log('[XOE-SW] Purged over-limit image caches for:', r.purged, 'thread records');
   }
 
   if (totalPurged > 0) {
@@ -181,7 +182,12 @@ async function handleMessage(message, sender) {
       if (!Array.isArray(thread.tweets)) {
         throw new Error('Invalid tweets data');
       }
+      const validation = validateThreadForStorage(thread);
+      if (!validation.ok) {
+        throw new Error(validation.error);
+      }
       delete thread.htmlContent;
+      thread.integrity = validation.integrity;
       thread.timestamp = thread.timestamp || Date.now();
       await addThread(thread);
       console.log('[XOE-SW] Thread saved:', thread.id, 'tweets:', thread.tweets.length);
