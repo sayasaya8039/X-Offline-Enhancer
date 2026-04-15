@@ -1,44 +1,79 @@
 /**
  * Offscreen Document - PDF Generation
- * Receives GENERATE_PDF messages, renders thread HTML,
- * converts to canvas via html2canvas, then generates PDF with jsPDF.
+ *
+ * Receives GENERATE_PDF { threadId } messages, reads the thread + image blobs
+ * directly from IndexedDB (via lib/db-esm.js), reconstructs the render tree
+ * with blob: object URLs, then produces a PDF via html2canvas + jsPDF.
+ *
+ * Image index contract with service_worker.js (task #7):
+ *   image_blobs key = tweetIdx * 10000 + imgIdx
+ * where tweetIdx is the tweet's position in the thread and imgIdx is the
+ * image's position within that tweet. buildThreadHTML decodes this directly.
  */
 
 const ALLOWED_IMAGE_HOSTS = ['pbs.twimg.com', 'abs.twimg.com', 'video.twimg.com'];
 
 function isAllowedImageUrl(url) {
-  if (!url) return false;
+  if (!url || typeof url !== 'string') return false;
   if (url.startsWith('data:image/')) return true;
+  if (url.startsWith('blob:')) return true;
   try { return ALLOWED_IMAGE_HOSTS.includes(new URL(url).hostname); }
   catch { return false; }
 }
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type !== 'GENERATE_PDF') return;
-  generatePDF(message.threadData)
-    .then((pdfBase64) => {
+// lib/db.js is an ES module (it uses static `import` from ./db-esm.js) so it
+// cannot be loaded via a classic <script src="lib/db.js"> tag. Instead we
+// dynamic-import lib/db-esm.js directly from this classic script. The promise
+// is memoized so concurrent GENERATE_PDF requests share one module instance.
+let dbModulePromise = null;
+function loadDb() {
+  if (!dbModulePromise) {
+    dbModulePromise = import('./lib/db-esm.js');
+  }
+  return dbModulePromise;
+}
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (!message || message.type !== 'GENERATE_PDF') return;
+  const threadId = message.threadId;
+  const filenameHint = message.filename;
+  if (!threadId) {
+    chrome.runtime.sendMessage({
+      type: 'PDF_ERROR',
+      error: 'GENERATE_PDF missing threadId',
+      threadId: null
+    });
+    return;
+  }
+  generatePDF(threadId, filenameHint)
+    .then(({ pdfBase64, filename }) => {
       chrome.runtime.sendMessage({
         type: 'PDF_GENERATED',
         pdfBase64,
-        filename: message.filename || 'thread.pdf'
+        filename,
+        threadId
       });
     })
     .catch((err) => {
       chrome.runtime.sendMessage({
         type: 'PDF_ERROR',
-        error: err.message
+        error: err && err.message ? err.message : String(err),
+        threadId
       });
     });
 });
 
 /**
  * Build HTML string from thread data for rendering.
- * All user-controlled text is escaped. Image src is validated.
+ * Image addressing: service_worker.js (task #7) writes each image_blobs row
+ * with `index = tweetIdx * 10000 + imgIdx`. Here we iterate tweets with their
+ * zero-based position T and each tweet's images with per-tweet position I,
+ * then look up `imageUrlMap.get(T * 10000 + I)` for a blob: object URL.
+ * Fallbacks: legacy base64 imageCache (pre-v3) → bare remote URL.
  */
-function buildThreadHTML(threadData) {
+function buildThreadHTML(threadData, imageUrlMap, legacyCache) {
   const tweets = threadData.tweets || [];
   const author = tweets[0]?.author || {};
-  const cache = threadData.imageCache || {};
 
   let html = `
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -49,13 +84,19 @@ function buildThreadHTML(threadData) {
       </div>
   `;
 
-  for (const tweet of tweets) {
+  for (let tweetIdx = 0; tweetIdx < tweets.length; tweetIdx++) {
+    const tweet = tweets[tweetIdx];
     html += `<div style="margin-bottom: 16px; padding-bottom: 16px; border-bottom: 1px solid #eff3f4;">`;
     html += `<div style="font-size: 15px; line-height: 1.5; white-space: pre-wrap;">${escapeHTML(tweet.text || '')}</div>`;
 
-    if (tweet.images && tweet.images.length > 0) {
-      for (const imgUrl of tweet.images) {
-        const src = cache[imgUrl] || imgUrl;
+    if (Array.isArray(tweet.images) && tweet.images.length > 0) {
+      for (let imgIdx = 0; imgIdx < tweet.images.length; imgIdx++) {
+        const imgUrl = tweet.images[imgIdx];
+        if (!isAllowedImageUrl(imgUrl)) continue;
+        const compositeKey = tweetIdx * 10000 + imgIdx;
+        const fromBlob = imageUrlMap.get(compositeKey);
+        const fromLegacy = legacyCache ? legacyCache[imgUrl] : null;
+        const src = fromBlob || fromLegacy || imgUrl;
         if (isAllowedImageUrl(src)) {
           html += `<img src="${escapeAttr(src)}" style="max-width: 100%; margin-top: 8px; border-radius: 12px;" crossorigin="anonymous" />`;
         }
@@ -73,9 +114,6 @@ function buildThreadHTML(threadData) {
   return html;
 }
 
-/**
- * Escape HTML special characters
- */
 function escapeHTML(str) {
   if (typeof str !== 'string') return '';
   return str
@@ -86,9 +124,6 @@ function escapeHTML(str) {
     .replace(/'/g, '&#39;');
 }
 
-/**
- * Escape for use in HTML attribute values
- */
 function escapeAttr(str) {
   if (typeof str !== 'string') return '';
   return str
@@ -99,9 +134,6 @@ function escapeAttr(str) {
     .replace(/>/g, '&gt;');
 }
 
-/**
- * Wait for all images in the render area to load (with timeout)
- */
 function waitForImages(container) {
   const images = container.querySelectorAll('img');
   if (images.length === 0) return Promise.resolve();
@@ -120,67 +152,92 @@ function waitForImages(container) {
 }
 
 /**
- * Generate PDF from thread data.
- * - html2canvas scale reduced to 1.5 to save memory (H9)
- * - canvas.toDataURL() called once and cached (C4)
- * - Canvas explicitly freed after use
+ * Generate PDF for a thread stored in IndexedDB.
+ * - Fetches thread record + image blobs via lib/db-esm.js
+ * - Creates blob: object URLs for each image, cleaned up in finally{}
+ * - Tolerates legacy pre-v3 threads that still carry inline base64 imageCache
  */
-async function generatePDF(threadData) {
+async function generatePDF(threadId, filenameHint) {
+  const db = await loadDb();
+
+  const thread = await db.getThread(threadId);
+  if (!thread) throw new Error(`Thread not found in IDB: ${threadId}`);
+
+  const imageRecords = await db.getImagesForThread(threadId);
+
+  const imageUrlMap = new Map();
+  const createdObjectUrls = [];
   const renderArea = document.getElementById('render-area');
+  let canvas = null;
 
-  // 1. Render HTML
-  renderArea.innerHTML = buildThreadHTML(threadData);
+  try {
+    for (const rec of imageRecords) {
+      if (rec && rec.blob) {
+        const url = URL.createObjectURL(rec.blob);
+        createdObjectUrls.push(url);
+        imageUrlMap.set(rec.index, url);
+      }
+    }
 
-  // 2. Wait for images to load
-  await waitForImages(renderArea);
+    // backward compat for pre-v3 base64 imageCache — only consulted when the
+    // image_blobs store returned nothing for this thread (or for individual
+    // missing indexes inside buildThreadHTML).
+    const legacyCache = thread.imageCache && typeof thread.imageCache === 'object'
+      ? thread.imageCache
+      : null;
 
-  // Small delay for rendering to settle
-  await new Promise(r => setTimeout(r, 100));
+    renderArea.innerHTML = buildThreadHTML(thread, imageUrlMap, legacyCache);
 
-  // 3. Convert to canvas via html2canvas (scale: 1.5 instead of 2)
-  const canvas = await html2canvas(renderArea, {
-    scale: 1.5,
-    useCORS: true,
-    allowTaint: false,
-    backgroundColor: '#ffffff',
-    width: 595,
-    windowWidth: 595
-  });
+    await waitForImages(renderArea);
+    await new Promise(r => setTimeout(r, 100));
 
-  // 4. Cache toDataURL result once (C4 fix - was called per page in loop)
-  const imageData = canvas.toDataURL('image/jpeg', 0.92);
+    canvas = await html2canvas(renderArea, {
+      scale: 1.5,
+      useCORS: true,
+      allowTaint: false,
+      backgroundColor: '#ffffff',
+      width: 595,
+      windowWidth: 595
+    });
 
-  // 5. Generate PDF with jsPDF (page splitting)
-  const { jsPDF } = window.jspdf;
-  const pdf = new jsPDF('p', 'pt', 'a4');
+    const imageData = canvas.toDataURL('image/jpeg', 0.92);
 
-  const pageWidth = 595;
-  const pageHeight = 842;
-  const imgWidth = pageWidth;
-  const imgHeight = (canvas.height * imgWidth) / canvas.width;
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF('p', 'pt', 'a4');
 
-  let heightLeft = imgHeight;
-  let position = 0;
+    const pageWidth = 595;
+    const pageHeight = 842;
+    const imgWidth = pageWidth;
+    const imgHeight = (canvas.height * imgWidth) / canvas.width;
 
-  // First page
-  pdf.addImage(imageData, 'JPEG', 0, position, imgWidth, imgHeight);
-  heightLeft -= pageHeight;
+    let heightLeft = imgHeight;
+    let position = 0;
 
-  // Additional pages
-  while (heightLeft > 0) {
-    position -= pageHeight;
-    pdf.addPage();
     pdf.addImage(imageData, 'JPEG', 0, position, imgWidth, imgHeight);
     heightLeft -= pageHeight;
+
+    while (heightLeft > 0) {
+      position -= pageHeight;
+      pdf.addPage();
+      pdf.addImage(imageData, 'JPEG', 0, position, imgWidth, imgHeight);
+      heightLeft -= pageHeight;
+    }
+
+    const pdfBase64 = pdf.output('datauristring');
+    const filename = filenameHint || `thread-${threadId}.pdf`;
+
+    return { pdfBase64, filename };
+  } finally {
+    // Always free object URLs and DOM/canvas memory, even on failure, so a
+    // crash mid-render can't leak blob references for the lifetime of the
+    // offscreen document.
+    if (renderArea) renderArea.innerHTML = '';
+    if (canvas) {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+    for (const url of createdObjectUrls) {
+      try { URL.revokeObjectURL(url); } catch { /* noop */ }
+    }
   }
-
-  // 6. Return as Base64 data URI
-  const pdfBase64 = pdf.output('datauristring');
-
-  // 7. Clean up: clear render area and free canvas memory
-  renderArea.innerHTML = '';
-  canvas.width = 0;
-  canvas.height = 0;
-
-  return pdfBase64;
 }

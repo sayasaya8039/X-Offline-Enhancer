@@ -7,6 +7,7 @@ import {
   addThread, getThread, getAllThreads, deleteThread, deleteAllThreads,
   searchThreads, getSavedIds, getStorageSize,
   purgeExpiredCaches, purgeUntilUnderLimit,
+  addImages,
   addVideoBlob, deleteVideosByThread, deleteAllVideos
 } from './lib/db-esm.js';
 import { validateThreadForStorage } from './lib/thread-model.mjs';
@@ -57,6 +58,16 @@ async function runCacheCleanup() {
   return totalPurged;
 }
 
+// Debounced cleanup: collapse rapid SAVE_THREAD bursts into one run per minute.
+let cleanupTimer = null;
+function scheduleCleanup() {
+  if (cleanupTimer) clearTimeout(cleanupTimer);
+  cleanupTimer = setTimeout(() => {
+    cleanupTimer = null;
+    runCacheCleanup().catch((err) => console.warn('[XOE-SW] Scheduled cleanup error:', err.message));
+  }, 60_000);
+}
+
 // ─── Side Panel Setup ───────────────────────────────────────
 
 if (chrome.sidePanel) {
@@ -69,12 +80,16 @@ if (chrome.sidePanel) {
 }
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status !== 'complete' || !chrome.sidePanel) return;
+  // Only react to URL/status transitions — skip noisy events like title/favicon/audible.
+  if (!changeInfo.url && !changeInfo.status) return;
+  if (!chrome.sidePanel) return;
+  // Only configure the side panel for X/Twitter tabs.
+  if (!isXUrl(tab?.url)) return;
   try {
     chrome.sidePanel.setOptions({
       tabId,
       path: 'sidepanel.html',
-      enabled: isXUrl(tab.url)
+      enabled: true
     });
   } catch {}
 });
@@ -187,10 +202,16 @@ async function handleMessage(message, sender) {
         throw new Error(validation.error);
       }
       delete thread.htmlContent;
+      // Legacy base64 payload — storage layer strips imageCache but be explicit.
+      delete thread.imageCache;
       thread.integrity = validation.integrity;
       thread.timestamp = thread.timestamp || Date.now();
+
+      const pendingImageUrls = Array.isArray(thread.imageUrls) ? thread.imageUrls : [];
+
       await addThread(thread);
-      console.log('[XOE-SW] Thread saved:', thread.id, 'tweets:', thread.tweets.length);
+      console.log('[XOE-SW] Thread saved:', thread.id, 'tweets:', thread.tweets.length,
+                  'imageUrls:', pendingImageUrls.length);
 
       if (sender.tab?.id) {
         chrome.tabs.sendMessage(sender.tab.id, {
@@ -199,10 +220,23 @@ async function handleMessage(message, sender) {
       }
       broadcastToExtension({ type: 'THREAD_SAVED', threadId: thread.id });
 
-      // Run cleanup after save (non-blocking)
-      runCacheCleanup().catch(() => {});
+      // Fire-and-forget image fetch. The SW stays alive while these awaited
+      // Promises are pending, even after sendResponse returns. Any throw is
+      // swallowed so an image network failure cannot kill the worker.
+      if (pendingImageUrls.length > 0) {
+        fetchAndStoreImages(thread.id, pendingImageUrls)
+          .then((n) => {
+            if (n > 0) {
+              broadcastToExtension({ type: 'THREAD_IMAGES_READY', threadId: thread.id, saved: n });
+            }
+          })
+          .catch((err) => console.warn('[XOE-SW] Image batch failed:', err.message));
+      }
 
-      return { success: true, id: thread.id };
+      // Debounced cleanup: collapse rapid saves into one run per minute.
+      scheduleCleanup();
+
+      return { success: true, id: thread.id, imageFetch: pendingImageUrls.length > 0 ? 'pending' : 'none' };
     }
 
     case 'DELETE_THREAD': {
@@ -287,21 +321,21 @@ async function handleMessage(message, sender) {
     }
 
     case 'PDF_GENERATED': {
-      broadcastToExtension({
+      await chrome.runtime.sendMessage({
         type: 'PDF_READY',
         pdfBase64: message.pdfBase64,
         filename: message.filename
-      });
-      setTimeout(() => closeOffscreenDocument(), 500);
+      }).catch(() => {});
+      await closeOffscreenDocument();
       return { success: true };
     }
 
     case 'PDF_ERROR': {
-      broadcastToExtension({
+      await chrome.runtime.sendMessage({
         type: 'PDF_READY',
         error: message.error
-      });
-      setTimeout(() => closeOffscreenDocument(), 500);
+      }).catch(() => {});
+      await closeOffscreenDocument();
       return { success: true };
     }
 
@@ -372,6 +406,7 @@ async function handleExportPDF(message) {
   const threadId = message.threadId;
   if (!threadId) throw new Error('Missing threadId for PDF export');
 
+  // Existence check only — offscreen (task #8) reads thread + images from IDB directly.
   const threadData = await getThread(threadId);
   if (!threadData) throw new Error(`Thread not found: ${threadId}`);
 
@@ -381,11 +416,101 @@ async function handleExportPDF(message) {
   const dateStr = new Date(threadData.timestamp).toISOString().slice(0, 10);
   const filename = `${authorHandle}_${dateStr}_${threadId.slice(0, 8)}.pdf`;
 
+  // New payload contract: no threadData — offscreen fetches from IDB.
   chrome.runtime.sendMessage({
-    type: 'GENERATE_PDF', threadData, filename
+    type: 'GENERATE_PDF', threadId, filename
   }).catch(() => {});
 
   return { success: true, message: 'PDF generation started' };
+}
+
+// ─── Image Fetch & Store ────────────────────────────────────
+
+const ALLOWED_IMAGE_HOSTS = ['pbs.twimg.com', 'abs.twimg.com'];
+const IMAGE_FETCH_CONCURRENCY = 3;
+const IMAGE_FETCH_TIMEOUT_MS = 30000;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10MB per image
+
+function isAllowedImageUrl(url) {
+  if (!url) return false;
+  try { return ALLOWED_IMAGE_HOSTS.includes(new URL(url).hostname); }
+  catch { return false; }
+}
+
+async function fetchImageWithTimeout(url) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), IMAGE_FETCH_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, { signal: ac.signal });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const blob = await resp.blob();
+    if (blob.size > MAX_IMAGE_BYTES) throw new Error('image too large: ' + blob.size);
+    return blob;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Fetch an array of image URLs in parallel (3-way semaphore), then persist
+ * successful results as Blobs via addImages() in a single rw transaction.
+ *
+ * Input items are `{ tweetIdx, imgIdx, url }` from content_script.js. The
+ * index stored in image_blobs is a composite integer `tweetIdx * 10000 + imgIdx`
+ * so offscreen/sidepanel can decode it back to tweet/image coordinates.
+ */
+async function fetchAndStoreImages(threadId, imageUrls) {
+  if (!Array.isArray(imageUrls) || imageUrls.length === 0) return 0;
+
+  const results = new Array(imageUrls.length);
+  let cursor = 0;
+
+  const worker = async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= imageUrls.length) return;
+      const entry = imageUrls[i];
+      if (!entry || !entry.url) continue;
+      if (!isAllowedImageUrl(entry.url)) {
+        console.warn('[XOE-SW] Image URL not allowed:', entry.url);
+        continue;
+      }
+      try {
+        const blob = await fetchImageWithTimeout(entry.url);
+        const tIdx = Number(entry.tweetIdx);
+        const iIdx = Number(entry.imgIdx);
+        const index = (Number.isFinite(tIdx) && Number.isFinite(iIdx))
+          ? (tIdx * 10000) + iIdx
+          : (Number.isFinite(Number(entry.index)) ? Number(entry.index) : i);
+        results[i] = {
+          index,
+          blob,
+          mimeType: blob.type || 'image/jpeg'
+        };
+      } catch (err) {
+        console.warn('[XOE-SW] Image fetch failed:', entry.url, err.message);
+      }
+    }
+  };
+
+  try {
+    const pool = [];
+    const n = Math.min(IMAGE_FETCH_CONCURRENCY, imageUrls.length);
+    for (let i = 0; i < n; i++) pool.push(worker());
+    await Promise.allSettled(pool);
+
+    const ready = results.filter(Boolean);
+    if (ready.length === 0) {
+      console.warn('[XOE-SW] No images fetched successfully for', threadId);
+      return 0;
+    }
+    const stored = await addImages(threadId, ready);
+    console.log('[XOE-SW] Stored', stored, '/', imageUrls.length, 'images for', threadId);
+    return stored;
+  } catch (err) {
+    console.warn('[XOE-SW] fetchAndStoreImages failure:', err.message);
+    return 0;
+  }
 }
 
 // ─── Broadcast Helper ───────────────────────────────────────

@@ -16,11 +16,11 @@
   const savedTweetIds = new Set();
 
   const MAX_IMAGES = 50;
-  const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
   const ALLOWED_IMAGE_HOSTS = ['pbs.twimg.com', 'abs.twimg.com', 'video.twimg.com'];
-  const PARALLEL_FETCH_LIMIT = 4;
   const MAX_VIDEO_BYTES = 50 * 1024 * 1024;
   const MAX_VIDEOS_PER_THREAD = 10;
+
+  try { performance.setResourceTimingBufferSize(500); } catch {}
 
   // ── Helpers ──────────────────────────────────────────────
 
@@ -91,7 +91,7 @@
     return /\/status\/\d+/.test(location.pathname);
   }
 
-  function extractTweetData(articleEl) {
+  function extractTweetData(articleEl, videoEntries = null) {
     const id = extractTweetId(articleEl);
     if (!id) return null;
 
@@ -123,12 +123,12 @@
     });
 
     const hasVideo = !!(articleEl.querySelector('video') || articleEl.querySelector('[data-testid="videoPlayer"]'));
-    const videoUrl = hasVideo ? findVideoUrlForArticle(articleEl) : null;
+    const videoUrl = hasVideo ? findVideoUrlForArticle(articleEl, videoEntries) : null;
 
     return { id, text, textSource, author: { name, handle, avatarUrl }, timestamp, images, hasVideo, videoUrl };
   }
 
-  function findVideoUrlForArticle(articleEl) {
+  function findVideoUrlForArticle(articleEl, cachedEntries = null) {
     const videoEl = articleEl.querySelector('video');
     if (!videoEl) return null;
 
@@ -147,7 +147,7 @@
     if (posterMatch) {
       const mediaId = posterMatch[2];
       try {
-        const entries = performance.getEntriesByType('resource');
+        const entries = cachedEntries || performance.getEntriesByType('resource');
         let bestUrl = null;
         let bestRes = 0;
         for (const entry of entries) {
@@ -207,10 +207,17 @@
     if (articles.length === 0) {
       articles = scopeRoot.querySelectorAll('article[role="article"]');
     }
+
+    let videoEntries = null;
+    try {
+      videoEntries = performance.getEntriesByType('resource')
+        .filter((e) => e.name && e.name.includes('video.twimg.com'));
+    } catch { videoEntries = []; }
+
     const candidates = [];
     const seen = new Set();
     for (const article of articles) {
-      const data = extractTweetData(article);
+      const data = extractTweetData(article, videoEntries);
       if (data && !seen.has(data.id)) {
         seen.add(data.id);
         candidates.push(data);
@@ -224,41 +231,6 @@
 
     const clickedTweet = candidates.find((tweet) => tweet.id === clickedTweetId);
     return clickedTweet ? [clickedTweet] : [];
-  }
-
-  async function fetchImageAsBase64(url) {
-    if (!isAllowedImageUrl(url)) return null;
-    try {
-      const resp = await fetch(url);
-      const blob = await resp.blob();
-      if (blob.size > MAX_IMAGE_BYTES) return null;
-      return new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result);
-        reader.onerror = () => resolve(null);
-        reader.readAsDataURL(blob);
-      });
-    } catch {
-      return null;
-    }
-  }
-
-  async function fetchImagesParallel(urls) {
-    const cache = {};
-    const queue = [...urls];
-    const workers = [];
-    for (let i = 0; i < Math.min(PARALLEL_FETCH_LIMIT, queue.length); i++) {
-      workers.push((async () => {
-        while (queue.length > 0) {
-          const url = queue.shift();
-          if (url && !cache[url]) {
-            cache[url] = await fetchImageAsBase64(url);
-          }
-        }
-      })());
-    }
-    await Promise.all(workers);
-    return cache;
   }
 
   // ── Save Logic ───────────────────────────────────────────
@@ -282,19 +254,22 @@
 
       log('Saving thread:', tweetId, 'tweets:', tweets.length);
 
-      const urlSet = new Set();
-      let count = 0;
-      for (const tweet of tweets) {
-        for (const imgUrl of tweet.images) {
-          if (count >= MAX_IMAGES) break;
-          if (isAllowedImageUrl(imgUrl)) { urlSet.add(imgUrl); count++; }
-        }
-        if (tweet.author.avatarUrl && isAllowedImageUrl(tweet.author.avatarUrl)) {
-          urlSet.add(tweet.author.avatarUrl);
-        }
-      }
-
-      const imageCache = await fetchImagesParallel([...urlSet]);
+      // Build image URL metadata. imgIdx is per-tweet (0-based within the tweet).
+      // Service worker (task #7) fetches these URLs and writes real Blobs to
+      // the image_blobs store via addImages(threadId, [{index, blob, mimeType}]).
+      // The (tweetIdx, imgIdx) pair lets offscreen/sidepanel rebuild the same
+      // addressing used when rendering tweet.images[imgIdx].
+      const imageUrls = [];
+      let imgCount = 0;
+      tweets.forEach((tweet, tweetIdx) => {
+        tweet.images.forEach((imgUrl, imgIdx) => {
+          if (imgCount >= MAX_IMAGES) return;
+          if (isAllowedImageUrl(imgUrl)) {
+            imageUrls.push({ tweetIdx, imgIdx, url: imgUrl });
+            imgCount++;
+          }
+        });
+      });
 
       // Collect unique video URLs from tweets
       const videoUrls = [...new Set(
@@ -305,7 +280,7 @@
         id: tweetId,
         url: window.location.href,
         tweets,
-        imageCache,
+        imageUrls,
         videoUrls,
         timestamp: Date.now(),
         tags: []
@@ -422,7 +397,6 @@
 
   function injectButtons(article) {
     if (article.hasAttribute(PROCESSED_ATTR)) return;
-    if (article.querySelector('.xoe-actions')) return;
     article.setAttribute(PROCESSED_ATTR, 'true');
 
     const actionBar = findActionBar(article);
@@ -456,27 +430,51 @@
   // ── Observer ─────────────────────────────────────────────
 
   let processTimer = null;
+  const pendingArticles = new Set();
 
-  function processAllTweets() {
-    let articles = document.querySelectorAll('article[data-testid="tweet"]');
+  function processInitialTweets() {
+    let articles = document.querySelectorAll(`article[data-testid="tweet"]:not([${PROCESSED_ATTR}])`);
     if (articles.length === 0) {
-      articles = document.querySelectorAll('article[role="article"]');
+      articles = document.querySelectorAll(`article[role="article"]:not([${PROCESSED_ATTR}])`);
     }
-    articles.forEach(a => {
-      if (!a.hasAttribute(PROCESSED_ATTR) && !a.querySelector('.xoe-actions')) {
+    articles.forEach((a) => injectButtons(a));
+  }
+
+  function flushPending() {
+    pendingArticles.forEach((a) => {
+      if (a.isConnected && !a.hasAttribute(PROCESSED_ATTR)) {
         injectButtons(a);
       }
     });
+    pendingArticles.clear();
   }
 
-  const observer = new MutationObserver(() => {
+  function queueArticle(a) {
+    if (!a || a.hasAttribute(PROCESSED_ATTR)) return;
+    pendingArticles.add(a);
+  }
+
+  const observer = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        if (node.nodeType !== 1) continue;
+        if (node.matches && node.matches('article[data-testid="tweet"]')) {
+          queueArticle(node);
+        }
+        if (node.querySelectorAll) {
+          node.querySelectorAll(`article[data-testid="tweet"]:not([${PROCESSED_ATTR}])`)
+            .forEach(queueArticle);
+        }
+      }
+    }
+    if (pendingArticles.size === 0) return;
     if (processTimer) clearTimeout(processTimer);
-    processTimer = setTimeout(processAllTweets, 200);
+    processTimer = setTimeout(flushPending, 200);
   });
 
   function startObserving() {
     log('Starting observer');
-    processAllTweets();
+    processInitialTweets();
     const timeline = document.querySelector('[data-testid="primaryColumn"]')
                    || document.querySelector('[data-testid="DeckColumns"]')
                    || document.querySelector('main')
