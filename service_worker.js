@@ -4,7 +4,7 @@
  */
 
 import {
-  addThread, getThread, getAllThreads, deleteThread, deleteAllThreads,
+  addThread, getThread, deleteThread, deleteAllThreads,
   searchThreads, getSavedIds, getStorageSize,
   purgeExpiredCaches, purgeUntilUnderLimit, purgeBlobsOverflow,
   addImages,
@@ -283,11 +283,6 @@ async function handleMessage(message, sender) {
       await deleteAllVideos().catch(() => {});
       broadcastToExtension({ type: 'ALL_THREADS_DELETED' });
       return { success: true };
-    }
-
-    case 'GET_ALL_THREADS': {
-      const threads = await getAllThreads();
-      return { success: true, threads };
     }
 
     case 'GET_THREAD': {
