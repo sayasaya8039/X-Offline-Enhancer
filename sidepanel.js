@@ -26,6 +26,21 @@ let selectionMode = false;
 const selectedIds = new Set();
 const activeVideoBlobUrls = [];
 
+// Virtual scroll state
+const VIRT_INITIAL = 100;
+const VIRT_PAGE = 50;
+let threadsCache = [];
+let renderedCount = 0;
+let currentQuery = '';
+let loadMoreObserver = null;
+let sentinelEl = null;
+
+// Reader lazy mount
+let readerObserver = null;
+
+// THREAD_SAVED debounce
+let threadSavedTimer = null;
+
 // ─── Cache Settings ─────────────────────────────────────────
 
 const DEFAULT_CACHE_SETTINGS = {
@@ -73,6 +88,13 @@ const btnSelectAll = document.getElementById('btn-select-all');
 const btnDeleteSelected = document.getElementById('btn-delete-selected');
 const selectionCountEl = document.getElementById('selection-count');
 
+// Build a trash <svg><use href="#icon-trash"/></svg> once, clone per card
+const TRASH_ICON_TEMPLATE = (() => {
+  const tmp = document.createElement('div');
+  tmp.innerHTML = '<svg width="16" height="16" aria-hidden="true"><use href="#icon-trash"/></svg>';
+  return tmp.firstChild;
+})();
+
 // ─── Helpers ────────────────────────────────────────────────
 
 function formatBytes(bytes) {
@@ -115,6 +137,11 @@ function debounce(fn, ms) {
   };
 }
 
+function escapeAttr(v) {
+  // CSS.escape is available in all MV3 targets; fallback for safety
+  return typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(v) : String(v).replace(/"/g, '\\"');
+}
+
 function appendIntegrityBadge(container, integrity) {
   if (!integrity || integrity.status !== 'partial') return;
   const badge = document.createElement('span');
@@ -133,6 +160,19 @@ function renderIntegrityNotice(parent, integrity) {
     : 'reader-integrity reader-integrity-warning';
   notice.textContent = message;
   parent.appendChild(notice);
+}
+
+// Prefer the pre-computed summary from storage; fall back to primary tweet.
+function getThreadSummary(thread) {
+  if (thread && thread.summary) return thread.summary;
+  const t = pickPrimaryTweet(thread);
+  const author = (t && t.author) || {};
+  return {
+    primaryAuthor: author,
+    primaryText: (t && t.text) || '',
+    imageCount: (t && t.images) ? t.images.length : 0,
+    videoCount: t && t.hasVideo ? 1 : 0
+  };
 }
 
 // ─── Confirm Dialog (XSS-safe: DOM API only) ───────────────
@@ -188,10 +228,11 @@ async function updateStorageDisplay() {
       ? settings.cacheLimitMB * 1024 * 1024
       : Math.min(quota || 500 * 1024 * 1024, 500 * 1024 * 1024);
     storageText.textContent = `${formatBytes(usage)} / ${formatBytes(limitBytes)}`;
-    const pct = limitBytes > 0 ? Math.min((usage / limitBytes) * 100, 100) : 0;
-    storageFill.style.width = pct + '%';
-    if (pct > 90) storageFill.style.background = '#f4212e';
-    else if (pct > 70) storageFill.style.background = '#ffd400';
+    const pct = limitBytes > 0 ? Math.min(usage / limitBytes, 1) : 0;
+    // Use transform: scaleX (GPU-composited) instead of width to avoid layout
+    storageFill.style.transform = `scaleX(${pct})`;
+    if (pct > 0.9) storageFill.style.background = '#f4212e';
+    else if (pct > 0.7) storageFill.style.background = '#ffd400';
     else storageFill.style.background = '';
   } catch (err) {
     console.error('[XOE] Storage display error:', err);
@@ -258,6 +299,7 @@ function enterSelectionMode() {
   headerNormal.style.display = 'none';
   headerSelection.style.display = '';
   threadListEl.classList.add('selection-mode');
+  threadListEl.classList.remove('all-selected');
   updateSelectionCount();
 }
 
@@ -267,10 +309,21 @@ function exitSelectionMode() {
   headerNormal.style.display = '';
   headerSelection.style.display = 'none';
   threadListEl.classList.remove('selection-mode');
+  threadListEl.classList.remove('all-selected');
   threadListEl.querySelectorAll('.thread-card.selected').forEach(c => c.classList.remove('selected'));
 }
 
+function materializeAllSelected() {
+  if (!threadListEl.classList.contains('all-selected')) return;
+  threadListEl.classList.remove('all-selected');
+  threadListEl.querySelectorAll('.thread-card').forEach(c => {
+    if (selectedIds.has(c.dataset.threadId)) c.classList.add('selected');
+  });
+}
+
 function toggleSelection(threadId, card) {
+  // If the fast-path bulk class is active, switch to per-card before toggling.
+  materializeAllSelected();
   if (selectedIds.has(threadId)) {
     selectedIds.delete(threadId);
     card.classList.remove('selected');
@@ -282,19 +335,20 @@ function toggleSelection(threadId, card) {
 }
 
 function selectAll() {
-  const isAllSelected = selectedIds.size ===
-    threadListEl.querySelectorAll('.thread-card').length;
+  const allIds = threadsCache.map(t => String(t.id));
+  const total = allIds.length;
+  const isAllSelected = selectedIds.size === total && total > 0;
 
   if (isAllSelected) {
-    // Deselect all
     selectedIds.clear();
+    threadListEl.classList.remove('all-selected');
     threadListEl.querySelectorAll('.thread-card.selected').forEach(c => c.classList.remove('selected'));
   } else {
-    // Select all
-    threadListEl.querySelectorAll('.thread-card').forEach(card => {
-      const id = card.dataset.threadId;
-      if (id) { selectedIds.add(id); card.classList.add('selected'); }
-    });
+    selectedIds.clear();
+    allIds.forEach(id => selectedIds.add(id));
+    // Bulk class avoids O(n) class updates on every card
+    threadListEl.classList.add('all-selected');
+    threadListEl.querySelectorAll('.thread-card.selected').forEach(c => c.classList.remove('selected'));
   }
   updateSelectionCount();
 }
@@ -302,8 +356,7 @@ function selectAll() {
 function updateSelectionCount() {
   selectionCountEl.textContent = `${selectedIds.size}件選択`;
   btnDeleteSelected.disabled = selectedIds.size === 0;
-
-  const total = threadListEl.querySelectorAll('.thread-card').length;
+  const total = threadsCache.length;
   btnSelectAll.textContent = (selectedIds.size === total && total > 0) ? '全解除' : '全選択';
 }
 
@@ -317,146 +370,358 @@ async function deleteSelectedThreads() {
   if (!ok) return;
 
   const deletedIds = [...selectedIds];
-  for (const id of deletedIds) {
-    await deleteThread(id);
-    await deleteVideosByThread(id).catch(() => {});
-  }
+  // H7: parallel delete (was serial for-await)
+  await Promise.all(deletedIds.map(id =>
+    Promise.all([
+      deleteThread(id),
+      deleteVideosByThread(id).catch(() => {})
+    ])
+  ));
   chrome.runtime.sendMessage({ type: 'NOTIFY_THREADS_DELETED', threadIds: deletedIds }).catch(() => {});
   exitSelectionMode();
   loadThreadList(searchInput.value.trim());
   updateStorageDisplay();
 }
 
-// ─── Thread List (lightweight meta, no imageCache) ──────────
+// ─── Thread Card Creation (uses summary, cloned trash icon) ──
 
-const TRASH_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"></path></svg>';
+function createThreadCard(thread, animDelay) {
+  const card = document.createElement('div');
+  card.className = 'thread-card';
+  if (animDelay != null) card.style.animationDelay = `${animDelay}s`;
+  card.dataset.threadId = String(thread.id);
+
+  const summary = getThreadSummary(thread);
+  const author = summary.primaryAuthor || {};
+
+  const avatarDiv = document.createElement('div');
+  avatarDiv.className = 'card-avatar';
+  if (author.avatarUrl && isAllowedImageUrl(author.avatarUrl)) {
+    const img = document.createElement('img');
+    img.src = author.avatarUrl;
+    img.alt = '';
+    img.loading = 'lazy';
+    avatarDiv.appendChild(img);
+  }
+
+  const bodyDiv = document.createElement('div');
+  bodyDiv.className = 'card-body';
+
+  const headerDiv = document.createElement('div');
+  headerDiv.className = 'card-header';
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'card-name';
+  nameSpan.textContent = author.name || '不明';
+  const handleSpan = document.createElement('span');
+  handleSpan.className = 'card-handle';
+  handleSpan.textContent = author.handle ? '@' + author.handle : '';
+  const sepSpan = document.createElement('span');
+  sepSpan.className = 'card-separator';
+  sepSpan.textContent = '·';
+  const dateSpan = document.createElement('span');
+  dateSpan.className = 'card-date';
+  dateSpan.textContent = formatDate(thread.timestamp);
+  headerDiv.append(nameSpan, handleSpan, sepSpan, dateSpan);
+
+  const textDiv = document.createElement('div');
+  textDiv.className = 'card-text';
+  textDiv.textContent = truncate(summary.primaryText || '', 100);
+
+  const metaDiv = document.createElement('div');
+  metaDiv.className = 'card-meta';
+  const tagsDiv = document.createElement('div');
+  tagsDiv.className = 'card-tags';
+  (thread.tags || []).slice(0, 3).forEach(t => {
+    const tagSpan = document.createElement('span');
+    tagSpan.className = 'card-tag';
+    tagSpan.textContent = t;
+    tagsDiv.appendChild(tagSpan);
+  });
+  appendIntegrityBadge(tagsDiv, thread.integrity);
+
+  const deleteBtn = document.createElement('button');
+  deleteBtn.className = 'card-delete';
+  deleteBtn.dataset.deleteId = String(thread.id);
+  deleteBtn.title = '削除';
+  deleteBtn.appendChild(TRASH_ICON_TEMPLATE.cloneNode(true));
+
+  metaDiv.append(tagsDiv, deleteBtn);
+  bodyDiv.append(headerDiv, textDiv, metaDiv);
+  card.append(avatarDiv, bodyDiv);
+  return card;
+}
+
+// ─── Thread List Virtual Scroll ─────────────────────────────
+
+function ensureSentinel() {
+  if (!sentinelEl) {
+    sentinelEl = document.createElement('div');
+    sentinelEl.className = 'list-sentinel';
+    sentinelEl.style.height = '1px';
+  }
+  return sentinelEl;
+}
+
+function teardownLoadMoreObserver() {
+  if (loadMoreObserver) {
+    loadMoreObserver.disconnect();
+    loadMoreObserver = null;
+  }
+  if (sentinelEl && sentinelEl.parentNode) {
+    sentinelEl.parentNode.removeChild(sentinelEl);
+  }
+}
+
+function setupLoadMoreObserver() {
+  teardownLoadMoreObserver();
+  if (renderedCount >= threadsCache.length) return;
+  const sentinel = ensureSentinel();
+  threadListEl.appendChild(sentinel);
+  loadMoreObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) {
+        renderMore();
+        break;
+      }
+    }
+  }, { root: threadListView, rootMargin: '400px' });
+  loadMoreObserver.observe(sentinel);
+}
+
+function renderMore() {
+  if (renderedCount >= threadsCache.length) {
+    teardownLoadMoreObserver();
+    return;
+  }
+  const end = Math.min(renderedCount + VIRT_PAGE, threadsCache.length);
+  const frag = document.createDocumentFragment();
+  for (let i = renderedCount; i < end; i++) {
+    // H10: animationDelay only applied to first 10 cards to avoid Nx composite thrash
+    const delay = i < 10 ? i * 0.04 : null;
+    frag.appendChild(createThreadCard(threadsCache[i], delay));
+  }
+  if (sentinelEl && sentinelEl.parentNode) {
+    threadListEl.insertBefore(frag, sentinelEl);
+  } else {
+    threadListEl.appendChild(frag);
+  }
+  renderedCount = end;
+  if (renderedCount >= threadsCache.length) {
+    teardownLoadMoreObserver();
+  }
+}
 
 async function loadThreadList(query) {
+  currentQuery = query || '';
   let threads;
   try {
-    threads = query ? await searchThreads(query) : await getAllThreadsMeta();
+    threads = currentQuery ? await searchThreads(currentQuery) : await getAllThreadsMeta();
   } catch (err) {
     console.error('[XOE] loadThreadList error:', err);
+    threadsCache = [];
+    renderedCount = 0;
+    teardownLoadMoreObserver();
     threadListEl.textContent = '';
     emptyState.style.display = 'flex';
     return;
   }
 
-  if (!threads || threads.length === 0) {
-    threadListEl.textContent = '';
-    emptyState.style.display = 'flex';
-    return;
-  }
-
-  emptyState.style.display = 'none';
-  const fragment = document.createDocumentFragment();
-
-  threads.forEach((thread, i) => {
-    const card = document.createElement('div');
-    card.className = 'thread-card';
-    card.style.animationDelay = `${Math.min(i * 0.04, 0.5)}s`;
-    card.dataset.threadId = thread.id;
-
-    const firstTweet = pickPrimaryTweet(thread);
-    const author = firstTweet?.author || {};
-
-    const avatarDiv = document.createElement('div');
-    avatarDiv.className = 'card-avatar';
-    if (author.avatarUrl && isAllowedImageUrl(author.avatarUrl)) {
-      const img = document.createElement('img');
-      img.src = author.avatarUrl;
-      img.alt = '';
-      img.loading = 'lazy';
-      avatarDiv.appendChild(img);
-    }
-
-    const bodyDiv = document.createElement('div');
-    bodyDiv.className = 'card-body';
-
-    const headerDiv = document.createElement('div');
-    headerDiv.className = 'card-header';
-    const nameSpan = document.createElement('span');
-    nameSpan.className = 'card-name';
-    nameSpan.textContent = author.name || '不明';
-    const handleSpan = document.createElement('span');
-    handleSpan.className = 'card-handle';
-    handleSpan.textContent = author.handle ? '@' + author.handle : '';
-    const sepSpan = document.createElement('span');
-    sepSpan.className = 'card-separator';
-    sepSpan.textContent = '·';
-    const dateSpan = document.createElement('span');
-    dateSpan.className = 'card-date';
-    dateSpan.textContent = formatDate(thread.timestamp);
-    headerDiv.append(nameSpan, handleSpan, sepSpan, dateSpan);
-
-    const textDiv = document.createElement('div');
-    textDiv.className = 'card-text';
-    textDiv.textContent = truncate(firstTweet?.text || '', 100);
-
-    const metaDiv = document.createElement('div');
-    metaDiv.className = 'card-meta';
-    const tagsDiv = document.createElement('div');
-    tagsDiv.className = 'card-tags';
-    (thread.tags || []).slice(0, 3).forEach(t => {
-      const tagSpan = document.createElement('span');
-      tagSpan.className = 'card-tag';
-      tagSpan.textContent = t;
-      tagsDiv.appendChild(tagSpan);
-    });
-    appendIntegrityBadge(tagsDiv, thread.integrity);
-
-    const deleteBtn = document.createElement('button');
-    deleteBtn.className = 'card-delete';
-    deleteBtn.dataset.deleteId = String(thread.id);
-    deleteBtn.title = '削除';
-    deleteBtn.innerHTML = TRASH_SVG;
-
-    metaDiv.append(tagsDiv, deleteBtn);
-    bodyDiv.append(headerDiv, textDiv, metaDiv);
-    card.append(avatarDiv, bodyDiv);
-    fragment.appendChild(card);
-  });
-
+  threadsCache = threads || [];
+  renderedCount = 0;
+  teardownLoadMoreObserver();
   threadListEl.textContent = '';
-  threadListEl.appendChild(fragment);
+
+  if (threadsCache.length === 0) {
+    emptyState.style.display = 'flex';
+    updateStorageDisplay();
+    return;
+  }
+  emptyState.style.display = 'none';
+
+  const initialEnd = Math.min(VIRT_INITIAL, threadsCache.length);
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < initialEnd; i++) {
+    const delay = i < 10 ? i * 0.04 : null;
+    frag.appendChild(createThreadCard(threadsCache[i], delay));
+  }
+  threadListEl.appendChild(frag);
+  renderedCount = initialEnd;
+  setupLoadMoreObserver();
   updateStorageDisplay();
 }
 
-// ─── Reader View (full data with imageCache) ────────────────
+// C6: incremental update for newly saved threads (no full rebuild).
+async function prependNewestThread() {
+  if (currentQuery) {
+    // In search mode, fall back to full refresh.
+    loadThreadList(currentQuery);
+    return;
+  }
+  try {
+    const latest = await getAllThreadsMeta(1);
+    if (!latest || latest.length === 0) {
+      loadThreadList('');
+      return;
+    }
+    const newest = latest[0];
+    const newestIdStr = String(newest.id);
+    if (threadsCache.length && String(threadsCache[0].id) === newestIdStr) {
+      // Same top thread — likely an update to it. Replace in-place.
+      threadsCache[0] = newest;
+      const selector = `.thread-card[data-thread-id="${escapeAttr(newestIdStr)}"]`;
+      const existingCard = threadListEl.querySelector(selector);
+      if (existingCard) {
+        const newCard = createThreadCard(newest, null);
+        existingCard.replaceWith(newCard);
+      }
+      return;
+    }
+    // Genuinely new thread — prepend to cache and DOM.
+    threadsCache.unshift(newest);
+    const newCard = createThreadCard(newest, null);
+    threadListEl.prepend(newCard);
+    renderedCount += 1;
+    emptyState.style.display = 'none';
+  } catch (err) {
+    console.error('[XOE] prependNewestThread error:', err);
+    loadThreadList(currentQuery);
+  }
+}
+
+function removeThreadFromList(id) {
+  const idStr = String(id);
+  threadsCache = threadsCache.filter(t => String(t.id) !== idStr);
+  selectedIds.delete(idStr);
+  try {
+    const selector = `.thread-card[data-thread-id="${escapeAttr(idStr)}"]`;
+    const card = threadListEl.querySelector(selector);
+    if (card) {
+      card.remove();
+      renderedCount = Math.max(0, renderedCount - 1);
+    }
+  } catch (err) {
+    console.warn('[XOE] removeThreadFromList selector error:', err);
+  }
+  if (threadsCache.length === 0) {
+    emptyState.style.display = 'flex';
+  }
+  updateSelectionCount();
+}
+
+// ─── Reader View (lazy-mount tweet articles) ───────────────
+
+function teardownReaderObserver() {
+  if (readerObserver) {
+    readerObserver.disconnect();
+    readerObserver = null;
+  }
+}
+
+function setupReaderObserver() {
+  teardownReaderObserver();
+  readerObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting && entry.target._xoeMount) {
+        const mount = entry.target._xoeMount;
+        entry.target._xoeMount = null;
+        readerObserver.unobserve(entry.target);
+        mount();
+      }
+    }
+  }, { root: readerView, rootMargin: '300px' });
+}
+
+function buildTweetArticle(tweet, cache, videoBlobMap) {
+  const tweetDiv = document.createElement('article');
+  tweetDiv.className = 'reader-tweet reader-tweet-pending';
+  // Reserve space so the observer has stable layout to detect intersection.
+  tweetDiv.style.minHeight = '120px';
+
+  tweetDiv._xoeMount = () => {
+    tweetDiv.classList.remove('reader-tweet-pending');
+    tweetDiv.style.minHeight = '';
+
+    const textDiv = document.createElement('div');
+    textDiv.className = 'reader-tweet-text';
+    textDiv.textContent = tweet.text || '';
+    tweetDiv.appendChild(textDiv);
+
+    if (tweet.images && tweet.images.length > 0) {
+      const imagesDiv = document.createElement('div');
+      imagesDiv.className = 'reader-tweet-images';
+      imagesDiv.dataset.count = Math.min(tweet.images.length, 4);
+      tweet.images.slice(0, 4).forEach(imgUrl => {
+        const src = cache[imgUrl] || imgUrl;
+        if (isAllowedImageUrl(src)) {
+          const img = document.createElement('img');
+          img.src = src;
+          img.alt = '';
+          img.loading = 'lazy';
+          img.onerror = function () { this.style.display = 'none'; };
+          imagesDiv.appendChild(img);
+        }
+      });
+      if (imagesDiv.children.length > 0) tweetDiv.appendChild(imagesDiv);
+    }
+
+    if (tweet.hasVideo && tweet.videoUrl && videoBlobMap.has(tweet.videoUrl)) {
+      const videoEl = document.createElement('video');
+      videoEl.src = videoBlobMap.get(tweet.videoUrl);
+      videoEl.controls = true;
+      // C7: preload='none' (was 'metadata') to avoid network fetch before interaction
+      videoEl.preload = 'none';
+      videoEl.playsInline = true;
+      videoEl.className = 'reader-tweet-video';
+      videoEl.onerror = function () { this.style.display = 'none'; };
+      tweetDiv.appendChild(videoEl);
+    } else if (tweet.hasVideo && !tweet.videoUrl) {
+      const notice = document.createElement('div');
+      notice.className = 'reader-video-notice';
+      notice.textContent = '動画は保存されていません';
+      tweetDiv.appendChild(notice);
+    }
+  };
+
+  return tweetDiv;
+}
 
 async function openReaderView(threadId) {
   let thread;
-  try { thread = await getThread(threadId); } catch (err) {
-    console.error('[XOE] getThread error:', err);
+  let videos = [];
+  try {
+    // H8: parallel fetch of thread + videos
+    const [t, v] = await Promise.all([
+      getThread(threadId),
+      getVideosByThread(threadId).catch(() => [])
+    ]);
+    thread = t;
+    videos = v || [];
+  } catch (err) {
+    console.error('[XOE] openReaderView fetch error:', err);
     return;
   }
   if (!thread) return;
 
   currentThreadId = threadId;
   currentView = 'reader';
-  readerContent.textContent = '';
 
-  // Revoke old video blob URLs
+  // Clear old content BEFORE revoking URLs so no <video> still references them.
+  teardownReaderObserver();
+  readerContent.textContent = '';
   activeVideoBlobUrls.forEach(u => URL.revokeObjectURL(u));
   activeVideoBlobUrls.length = 0;
 
-  // Load stored videos for this thread
-  let videoBlobMap = new Map();
-  try {
-    const videos = await getVideosByThread(threadId);
-    for (const v of videos) {
-      if (v.blob) {
-        const blobUrl = URL.createObjectURL(v.blob);
-        activeVideoBlobUrls.push(blobUrl);
-        videoBlobMap.set(v.url, blobUrl);
-      }
+  const videoBlobMap = new Map();
+  for (const v of videos) {
+    if (v && v.blob) {
+      const blobUrl = URL.createObjectURL(v.blob);
+      activeVideoBlobUrls.push(blobUrl);
+      videoBlobMap.set(v.url, blobUrl);
     }
-  } catch (err) {
-    console.error('[XOE] Video load error:', err);
   }
 
   const firstTweet = pickPrimaryTweet(thread);
-  const author = firstTweet?.author || {};
+  const author = (firstTweet && firstTweet.author) || {};
   const cache = thread.imageCache || {};
   const avatarSrc = cache[author.avatarUrl] || author.avatarUrl || '';
 
@@ -469,6 +734,7 @@ async function openReaderView(threadId) {
     const img = document.createElement('img');
     img.src = avatarSrc;
     img.alt = '';
+    img.loading = 'lazy';
     avatarDiv.appendChild(img);
   }
 
@@ -489,51 +755,18 @@ async function openReaderView(threadId) {
   renderIntegrityNotice(readerContent, thread.integrity);
 
   if (thread.tweets && thread.tweets.length > 0) {
-    thread.tweets.forEach(tweet => {
-      const tweetDiv = document.createElement('div');
-      tweetDiv.className = 'reader-tweet';
-
-      const textDiv = document.createElement('div');
-      textDiv.className = 'reader-tweet-text';
-      textDiv.textContent = tweet.text || '';
-      tweetDiv.appendChild(textDiv);
-
-      if (tweet.images && tweet.images.length > 0) {
-        const imagesDiv = document.createElement('div');
-        imagesDiv.className = 'reader-tweet-images';
-        imagesDiv.dataset.count = Math.min(tweet.images.length, 4);
-        tweet.images.slice(0, 4).forEach(imgUrl => {
-          const src = cache[imgUrl] || imgUrl;
-          if (isAllowedImageUrl(src)) {
-            const img = document.createElement('img');
-            img.src = src;
-            img.alt = '';
-            img.loading = 'lazy';
-            img.onerror = function () { this.style.display = 'none'; };
-            imagesDiv.appendChild(img);
-          }
-        });
-        if (imagesDiv.children.length > 0) tweetDiv.appendChild(imagesDiv);
+    setupReaderObserver();
+    thread.tweets.forEach((tweet, i) => {
+      const article = buildTweetArticle(tweet, cache, videoBlobMap);
+      readerContent.appendChild(article);
+      if (i < 3) {
+        // Eagerly mount above-the-fold so first paint has content.
+        const mount = article._xoeMount;
+        article._xoeMount = null;
+        if (mount) mount();
+      } else {
+        readerObserver.observe(article);
       }
-
-      // Video playback from stored blob
-      if (tweet.hasVideo && tweet.videoUrl && videoBlobMap.has(tweet.videoUrl)) {
-        const videoEl = document.createElement('video');
-        videoEl.src = videoBlobMap.get(tweet.videoUrl);
-        videoEl.controls = true;
-        videoEl.preload = 'metadata';
-        videoEl.playsInline = true;
-        videoEl.className = 'reader-tweet-video';
-        videoEl.onerror = function () { this.style.display = 'none'; };
-        tweetDiv.appendChild(videoEl);
-      } else if (tweet.hasVideo && !tweet.videoUrl) {
-        const notice = document.createElement('div');
-        notice.className = 'reader-video-notice';
-        notice.textContent = '動画は保存されていません';
-        tweetDiv.appendChild(notice);
-      }
-
-      readerContent.appendChild(tweetDiv);
     });
   } else if (thread.text) {
     const tweetDiv = document.createElement('div');
@@ -552,12 +785,14 @@ async function openReaderView(threadId) {
 }
 
 function closeReaderView() {
-  // Release video blob URLs to free memory
-  activeVideoBlobUrls.forEach(u => URL.revokeObjectURL(u));
-  activeVideoBlobUrls.length = 0;
+  teardownReaderObserver();
   currentView = 'list';
   currentThreadId = null;
   readerView.style.display = 'none';
+  // Remove video elements first so no <video>.src still references the blob URL
+  readerContent.textContent = '';
+  activeVideoBlobUrls.forEach(u => URL.revokeObjectURL(u));
+  activeVideoBlobUrls.length = 0;
   threadListView.style.display = '';
   document.getElementById('header').style.display = '';
   loadThreadList(searchInput.value.trim());
@@ -568,13 +803,11 @@ function closeReaderView() {
 threadListEl.addEventListener('click', (e) => {
   const card = e.target.closest('.thread-card');
 
-  // In selection mode, all clicks toggle selection
   if (selectionMode && card) {
     toggleSelection(card.dataset.threadId, card);
     return;
   }
 
-  // Normal mode: individual delete button
   const deleteBtn = e.target.closest('.card-delete');
   if (deleteBtn) {
     e.stopPropagation();
@@ -584,7 +817,7 @@ threadListEl.addEventListener('click', (e) => {
         deleteThread(id).then(() => {
           deleteVideosByThread(id).catch(() => {});
           chrome.runtime.sendMessage({ type: 'NOTIFY_THREAD_DELETED', threadId: id }).catch(() => {});
-          loadThreadList(searchInput.value.trim());
+          removeThreadFromList(id);
           updateStorageDisplay();
         });
       }
@@ -592,7 +825,6 @@ threadListEl.addEventListener('click', (e) => {
     return;
   }
 
-  // Normal mode: open reader
   if (card) openReaderView(card.dataset.threadId);
 });
 
@@ -640,9 +872,10 @@ btnDeleteThread.addEventListener('click', () => {
   });
 });
 
+// Search debounce tightened 300ms → 200ms (MEDIUM)
 searchInput.addEventListener('input', debounce(() => {
   loadThreadList(searchInput.value.trim());
-}, 300));
+}, 200));
 
 btnSelectMode.addEventListener('click', enterSelectionMode);
 btnCancelSelect.addEventListener('click', exitSelectionMode);
@@ -655,39 +888,99 @@ btnManualCleanup.addEventListener('click', onManualCleanup);
 
 // ─── Message Listener ───────────────────────────────────────
 
+// Debounce bursts of THREAD_SAVED (multi-thread batch save) to a single refresh.
+function scheduleThreadSavedRefresh() {
+  if (threadSavedTimer) clearTimeout(threadSavedTimer);
+  threadSavedTimer = setTimeout(() => {
+    threadSavedTimer = null;
+    if (currentView !== 'list') return;
+    prependNewestThread();
+    updateStorageDisplay();
+  }, 200);
+}
+
+async function handlePdfReady(message) {
+  pdfExporting = false;
+  btnExportPdf.disabled = false;
+
+  if (message.error) {
+    if (pdfToastLabel) pdfToastLabel.textContent = 'PDF生成エラー';
+    pdfDownloadLink.textContent = message.error;
+    pdfDownloadLink.removeAttribute('href');
+    pdfToast.style.display = '';
+    if (pdfToastTimer) clearTimeout(pdfToastTimer);
+    pdfToastTimer = setTimeout(() => { pdfToast.style.display = 'none'; }, 5000);
+    return;
+  }
+
+  // C3 new protocol: SW hands off via chrome.storage.session to avoid
+  // blowing up the message channel with large base64 payloads.
+  if (message.storageKey) {
+    try {
+      const data = await chrome.storage.session.get(message.storageKey);
+      const entry = data && data[message.storageKey];
+      const base64 = entry && entry.base64;
+      const filename = message.filename || (entry && entry.filename) || 'thread.pdf';
+      if (base64 && base64.startsWith('data:application/pdf')) {
+        if (pdfToastLabel) pdfToastLabel.textContent = 'PDF生成完了';
+        pdfDownloadLink.textContent = 'ダウンロード';
+        pdfDownloadLink.href = base64;
+        pdfDownloadLink.download = filename;
+        pdfToast.style.display = '';
+        if (pdfToastTimer) clearTimeout(pdfToastTimer);
+        pdfToastTimer = setTimeout(() => { pdfToast.style.display = 'none'; }, 8000);
+
+        // Auto-trigger download via temp anchor per brief
+        const a = document.createElement('a');
+        a.href = base64;
+        a.download = filename;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      } else if (pdfToastLabel) {
+        pdfToastLabel.textContent = 'PDFデータが見つかりません';
+        pdfToast.style.display = '';
+        if (pdfToastTimer) clearTimeout(pdfToastTimer);
+        pdfToastTimer = setTimeout(() => { pdfToast.style.display = 'none'; }, 5000);
+      }
+      await chrome.storage.session.remove(message.storageKey).catch(() => {});
+    } catch (err) {
+      console.error('[XOE] PDF storage fetch error:', err);
+    }
+    return;
+  }
+
+  // Legacy: inline base64 in message (backward compat)
+  if (message.pdfBase64 && message.pdfBase64.startsWith('data:application/pdf')) {
+    if (pdfToastLabel) pdfToastLabel.textContent = 'PDF生成完了';
+    pdfDownloadLink.textContent = 'ダウンロード';
+    pdfDownloadLink.href = message.pdfBase64;
+    pdfDownloadLink.download = message.filename || 'thread.pdf';
+    pdfToast.style.display = '';
+    if (pdfToastTimer) clearTimeout(pdfToastTimer);
+    pdfToastTimer = setTimeout(() => { pdfToast.style.display = 'none'; }, 8000);
+  }
+}
+
 chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === 'THREAD_SAVED' || message.type === 'CACHE_CLEANED') {
+  if (!message || !message.type) return;
+
+  if (message.type === 'THREAD_SAVED') {
+    scheduleThreadSavedRefresh();
+    return;
+  }
+  if (message.type === 'CACHE_CLEANED') {
     if (currentView === 'list') loadThreadList(searchInput.value.trim());
     updateStorageDisplay();
+    return;
   }
-
   if (message.type === 'VIDEOS_SAVED') {
     updateStorageDisplay();
+    return;
   }
-
   if (message.type === 'PDF_READY') {
-    pdfExporting = false;
-    btnExportPdf.disabled = false;
-
-    if (message.error) {
-      if (pdfToastLabel) pdfToastLabel.textContent = 'PDF生成エラー';
-      pdfDownloadLink.textContent = message.error;
-      pdfDownloadLink.removeAttribute('href');
-      pdfToast.style.display = '';
-      if (pdfToastTimer) clearTimeout(pdfToastTimer);
-      pdfToastTimer = setTimeout(() => { pdfToast.style.display = 'none'; }, 5000);
-      return;
-    }
-
-    if (message.pdfBase64 && message.pdfBase64.startsWith('data:application/pdf')) {
-      if (pdfToastLabel) pdfToastLabel.textContent = 'PDF生成完了';
-      pdfDownloadLink.textContent = 'ダウンロード';
-      pdfDownloadLink.href = message.pdfBase64;
-      pdfDownloadLink.download = message.filename || 'thread.pdf';
-      pdfToast.style.display = '';
-      if (pdfToastTimer) clearTimeout(pdfToastTimer);
-      pdfToastTimer = setTimeout(() => { pdfToast.style.display = 'none'; }, 8000);
-    }
+    handlePdfReady(message);
   }
 });
 

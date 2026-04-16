@@ -57,15 +57,15 @@ body {
 }
 
 /* === Header === */
+/* H9: backdrop-filter removed (expensive on every scroll); solid color + paint containment */
 #header {
   position: sticky;
   top: 0;
   z-index: 100;
-  background: rgba(0, 0, 0, 0.85);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  background: rgba(0, 0, 0, 0.92);
   border-bottom: 1px solid var(--border);
   padding: 12px 16px;
+  contain: paint;
 }
 
 .header-top {
@@ -220,10 +220,13 @@ body {
 
 .storage-fill {
   height: 100%;
+  width: 100%;
   background: var(--accent);
   border-radius: 2px;
-  width: 0%;
-  transition: width 0.5s ease;
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 0.5s ease, background-color var(--transition);
+  will-change: transform;
 }
 
 /* === Thread List === */
@@ -245,8 +248,11 @@ body {
   padding: 12px 16px;
   border-bottom: 1px solid var(--border);
   cursor: pointer;
-  transition: background var(--transition);
+  /* scoped transitions (was `background`) — explicit is cheaper to optimize */
+  transition: background-color var(--transition);
   animation: fadeIn 0.3s ease;
+  /* paint/layout isolation for large virtualized lists */
+  contain: layout paint;
 }
 .thread-card:hover {
   background: var(--bg-hover);
@@ -424,10 +430,9 @@ body {
   align-items: center;
   justify-content: space-between;
   padding: 10px 16px;
-  background: rgba(0, 0, 0, 0.85);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  background: rgba(0, 0, 0, 0.92);
   border-bottom: 1px solid var(--border);
+  contain: paint;
 }
 
 .reader-actions {
@@ -512,9 +517,15 @@ body {
   margin-bottom: 24px;
   padding-bottom: 24px;
   border-bottom: 1px solid var(--border);
+  contain: layout paint;
 }
 .reader-tweet:last-child {
   border-bottom: none;
+}
+
+/* Lazy-mount placeholder (article reserved but content not yet inserted) */
+.reader-tweet.reader-tweet-pending {
+  background: transparent;
 }
 
 .reader-tweet-text {
@@ -740,10 +751,12 @@ body {
   border-radius: 50%;
   flex-shrink: 0;
   align-self: center;
-  transition: all var(--transition);
+  /* scoped transitions (was `all`) to avoid paint churn on unrelated prop changes */
+  transition: background-color var(--transition), border-color var(--transition);
 }
 
-.selection-mode .thread-card.selected::before {
+.selection-mode .thread-card.selected::before,
+.selection-mode.all-selected .thread-card::before {
   background: var(--accent);
   border-color: var(--accent);
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3.5'%3E%3Cpolyline points='20 6 9 17 4 12'%3E%3C/polyline%3E%3C/svg%3E");
@@ -752,7 +765,8 @@ body {
   background-repeat: no-repeat;
 }
 
-.selection-mode .thread-card.selected {
+.selection-mode .thread-card.selected,
+.selection-mode.all-selected .thread-card {
   background: rgba(29, 161, 242, 0.08);
 }
 
@@ -760,7 +774,8 @@ body {
   background: rgba(29, 161, 242, 0.04);
 }
 
-.selection-mode .thread-card.selected:hover {
+.selection-mode .thread-card.selected:hover,
+.selection-mode.all-selected .thread-card:hover {
   background: rgba(29, 161, 242, 0.12);
 }
 
@@ -770,20 +785,23 @@ body {
 }
 
 /* === Settings Panel === */
+/* transform: scaleY is GPU-composited; max-height animation triggers layout every frame */
 .settings-panel {
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border);
   overflow: hidden;
   animation: settingsSlide 0.2s ease;
+  transform-origin: top;
+  will-change: transform, opacity;
 }
 
 @keyframes settingsSlide {
   from {
-    max-height: 0;
+    transform: scaleY(0);
     opacity: 0;
   }
   to {
-    max-height: 300px;
+    transform: scaleY(1);
     opacity: 1;
   }
 }
