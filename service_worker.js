@@ -133,6 +133,16 @@ chrome.runtime.onInstalled.addListener(async () => {
 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name.startsWith('pdf-gc:')) {
+    const storageKey = alarm.name.slice('pdf-gc:'.length);
+    try {
+      await chrome.storage.session.remove(storageKey);
+      console.log('[XOE-SW] PDF GC removed stale entry:', storageKey);
+    } catch (e) {
+      console.warn('[XOE-SW] PDF GC remove failed', e);
+    }
+    return;
+  }
   if (alarm.name === 'cache-cleanup') {
     runCacheCleanup().catch((err) => console.error('[XOE-SW] Alarm cleanup error:', err));
   } else if (alarm.name === 'cache-cleanup-debounce') {
@@ -347,6 +357,13 @@ async function handleMessage(message, sender) {
       // PDF payload lives in chrome.storage.session under message.storageKey.
       // Never relay base64 through the message bus — large payloads blow past
       // the structured-clone budget and stall the SW.
+      if (message.storageKey) {
+        try {
+          await chrome.alarms.create(`pdf-gc:${message.storageKey}`, { delayInMinutes: 10 });
+        } catch (e) {
+          console.warn('[XOE-SW] Failed to schedule PDF GC alarm', e);
+        }
+      }
       await chrome.runtime.sendMessage({
         type: 'PDF_READY',
         threadId: message.threadId,
@@ -355,6 +372,13 @@ async function handleMessage(message, sender) {
         size: message.size
       }).catch(() => {});
       scheduleOffscreenIdleClose();
+      return { success: true };
+    }
+
+    case 'PDF_CONSUMED': {
+      if (typeof message.storageKey === 'string') {
+        await chrome.alarms.clear(`pdf-gc:${message.storageKey}`).catch(() => {});
+      }
       return { success: true };
     }
 

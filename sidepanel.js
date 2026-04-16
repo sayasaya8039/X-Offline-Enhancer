@@ -944,9 +944,13 @@ async function handlePdfReady(message) {
         if (pdfToastTimer) clearTimeout(pdfToastTimer);
         pdfToastTimer = setTimeout(() => { pdfToast.style.display = 'none'; }, 5000);
       }
-      await chrome.storage.session.remove(message.storageKey).catch(() => {});
     } catch (err) {
       console.error('[XOE] PDF storage fetch error:', err);
+    } finally {
+      try { await chrome.storage.session.remove(message.storageKey); } catch {}
+      try {
+        await chrome.runtime.sendMessage({ type: 'PDF_CONSUMED', storageKey: message.storageKey });
+      } catch {}
     }
     return;
   }
