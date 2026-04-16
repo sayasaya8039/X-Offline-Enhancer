@@ -6,8 +6,6 @@
   "permissions": [
     "sidePanel",
     "storage",
-    "scripting",
-    "activeTab",
     "tabs",
     "offscreen",
     "alarms"

@@ -46,12 +46,13 @@ chrome.runtime.onMessage.addListener((message) => {
     return;
   }
   generatePDF(threadId, filenameHint)
-    .then(({ pdfBase64, filename }) => {
+    .then(({ storageKey, filename, size }) => {
       chrome.runtime.sendMessage({
         type: 'PDF_GENERATED',
-        pdfBase64,
+        threadId,
+        storageKey,
         filename,
-        threadId
+        size
       });
     })
     .catch((err) => {
@@ -223,10 +224,23 @@ async function generatePDF(threadId, filenameHint) {
       heightLeft -= pageHeight;
     }
 
-    const pdfBase64 = pdf.output('datauristring');
+    // jsPDF data-URI format: "data:application/pdf;filename=generated.pdf;base64,<...>"
+    // Strip to the raw base64 segment so sidepanel can reconstruct a Blob
+    // without needing to parse the URI format.
+    const dataUri = pdf.output('datauristring');
+    const commaIdx = dataUri.indexOf(',');
+    const base64 = commaIdx >= 0 ? dataUri.substring(commaIdx + 1) : dataUri;
     const filename = filenameHint || `thread-${threadId}.pdf`;
+    // Approximate decoded byte size from base64 length (pre-padding adjust
+    // unnecessary for display-only metadata).
+    const size = Math.floor((base64.length * 3) / 4);
 
-    return { pdfBase64, filename };
+    const storageKey = `pdf:${threadId}:${Date.now()}`;
+    await chrome.storage.session.set({
+      [storageKey]: { base64, filename, size }
+    });
+
+    return { storageKey, filename, size };
   } finally {
     // Always free object URLs and DOM/canvas memory, even on failure, so a
     // crash mid-render can't leak blob references for the lifetime of the

@@ -6,7 +6,7 @@
 import {
   addThread, getThread, getAllThreads, deleteThread, deleteAllThreads,
   searchThreads, getSavedIds, getStorageSize,
-  purgeExpiredCaches, purgeUntilUnderLimit,
+  purgeExpiredCaches, purgeUntilUnderLimit, purgeBlobsOverflow,
   addImages,
   addVideoBlob, deleteVideosByThread, deleteAllVideos
 } from './lib/db-esm.js';
@@ -59,13 +59,27 @@ async function runCacheCleanup() {
 }
 
 // Debounced cleanup: collapse rapid SAVE_THREAD bursts into one run per minute.
-let cleanupTimer = null;
+// chrome.alarms.create overwrites any existing alarm with the same name, which
+// gives us debounce semantics without a live setTimeout that the SW termination
+// would cancel.
 function scheduleCleanup() {
-  if (cleanupTimer) clearTimeout(cleanupTimer);
-  cleanupTimer = setTimeout(() => {
-    cleanupTimer = null;
-    runCacheCleanup().catch((err) => console.warn('[XOE-SW] Scheduled cleanup error:', err.message));
-  }, 60_000);
+  chrome.alarms.create('cache-cleanup-debounce', { delayInMinutes: 1 });
+}
+
+async function runDebouncedCleanup() {
+  const settings = await getCacheSettings();
+  try {
+    const r = await purgeBlobsOverflow({
+      maxBytes: Math.max(0, settings.cacheLimitMB) * 1024 * 1024,
+      maxAgeDays: settings.cacheTTLDays
+    });
+    const purged = r && typeof r.purged === 'number' ? r.purged : 0;
+    if (purged > 0) {
+      broadcastToExtension({ type: 'CACHE_CLEANED', purged });
+    }
+  } catch (err) {
+    console.warn('[XOE-SW] Debounced cleanup error:', err.message);
+  }
 }
 
 // ─── Side Panel Setup ───────────────────────────────────────
@@ -121,6 +135,10 @@ chrome.runtime.onInstalled.addListener(async () => {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'cache-cleanup') {
     runCacheCleanup().catch((err) => console.error('[XOE-SW] Alarm cleanup error:', err));
+  } else if (alarm.name === 'cache-cleanup-debounce') {
+    runDebouncedCleanup().catch((err) => console.warn('[XOE-SW] Debounced alarm error:', err.message));
+  } else if (alarm.name === 'offscreen-idle-close') {
+    await closeOffscreenDocument();
   }
 });
 
@@ -129,6 +147,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 let offscreenCreating = null;
 
 async function ensureOffscreenDocument() {
+  // New PDF generation extends the offscreen lifetime — cancel any pending idle-close.
+  try { await chrome.alarms.clear('offscreen-idle-close'); } catch {}
+
   const existingContexts = await chrome.runtime.getContexts({
     contextTypes: ['OFFSCREEN_DOCUMENT']
   });
@@ -153,6 +174,13 @@ async function ensureOffscreenDocument() {
 
 async function closeOffscreenDocument() {
   try { await chrome.offscreen.closeDocument(); } catch {}
+}
+
+// Schedule idle close 5 minutes after last PDF completion. Any new
+// ensureOffscreenDocument() call clears this alarm so the doc is kept alive
+// through back-to-back exports without recreating the DOM each time.
+function scheduleOffscreenIdleClose() {
+  chrome.alarms.create('offscreen-idle-close', { delayInMinutes: 5 });
 }
 
 // ─── Message Routing ────────────────────────────────────────
@@ -321,21 +349,27 @@ async function handleMessage(message, sender) {
     }
 
     case 'PDF_GENERATED': {
+      // PDF payload lives in chrome.storage.session under message.storageKey.
+      // Never relay base64 through the message bus — large payloads blow past
+      // the structured-clone budget and stall the SW.
       await chrome.runtime.sendMessage({
         type: 'PDF_READY',
-        pdfBase64: message.pdfBase64,
-        filename: message.filename
+        threadId: message.threadId,
+        storageKey: message.storageKey,
+        filename: message.filename,
+        size: message.size
       }).catch(() => {});
-      await closeOffscreenDocument();
+      scheduleOffscreenIdleClose();
       return { success: true };
     }
 
     case 'PDF_ERROR': {
       await chrome.runtime.sendMessage({
         type: 'PDF_READY',
+        threadId: message.threadId,
         error: message.error
       }).catch(() => {});
-      await closeOffscreenDocument();
+      scheduleOffscreenIdleClose();
       return { success: true };
     }
 
@@ -367,6 +401,8 @@ async function handleMessage(message, sender) {
 
 const ALLOWED_VIDEO_HOSTS = ['video.twimg.com'];
 const MAX_VIDEO_BYTES = 50 * 1024 * 1024; // 50MB per video
+const VIDEO_FETCH_TIMEOUT_MS = 60_000;
+const VIDEO_FETCH_CONCURRENCY = 2;
 
 function isAllowedVideoUrl(url) {
   if (!url) return false;
@@ -374,30 +410,76 @@ function isAllowedVideoUrl(url) {
   catch { return false; }
 }
 
-async function fetchAndStoreVideos(threadId, videoUrls) {
-  let saved = 0;
-  for (let i = 0; i < videoUrls.length; i++) {
-    const url = videoUrls[i];
-    if (!isAllowedVideoUrl(url)) continue;
-    try {
-      const resp = await fetch(url);
-      if (!resp.ok) {
-        console.warn('[XOE-SW] Video fetch HTTP', resp.status, url);
-        continue;
+async function fetchVideoWithTimeout(url, timeoutMs = VIDEO_FETCH_TIMEOUT_MS) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, { signal: ac.signal });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    // Reject before streaming the body when the server advertises a size over
+    // MAX_VIDEO_BYTES. Saves us from buffering 50MB+ just to discard it.
+    const cl = resp.headers.get('content-length');
+    if (cl) {
+      const n = Number(cl);
+      if (Number.isFinite(n) && n > MAX_VIDEO_BYTES) {
+        ac.abort();
+        throw new Error('content-length exceeds limit: ' + n);
       }
-      const blob = await resp.blob();
-      if (blob.size > MAX_VIDEO_BYTES) {
-        console.warn('[XOE-SW] Video too large:', blob.size, url);
-        continue;
-      }
-      await addVideoBlob(threadId, i, blob, url);
-      saved++;
-      console.log('[XOE-SW] Video stored:', i, 'size:', (blob.size / 1024 / 1024).toFixed(1) + 'MB');
-    } catch (err) {
-      console.warn('[XOE-SW] Video fetch failed:', url, err.message);
     }
+    const blob = await resp.blob();
+    if (blob.size > MAX_VIDEO_BYTES) {
+      throw new Error('video too large: ' + blob.size);
+    }
+    return blob;
+  } finally {
+    clearTimeout(timer);
   }
-  return saved;
+}
+
+// Dedupe concurrent FETCH_VIDEOS for the same thread — prevents two sidepanel
+// calls from racing and double-storing identical blobs.
+const inFlightVideoFetches = new Map();
+
+async function fetchAndStoreVideos(threadId, videoUrls) {
+  if (!Array.isArray(videoUrls) || videoUrls.length === 0) return 0;
+
+  const existing = inFlightVideoFetches.get(threadId);
+  if (existing) return existing;
+
+  const task = (async () => {
+    let saved = 0;
+    let cursor = 0;
+
+    const worker = async () => {
+      while (true) {
+        const i = cursor++;
+        if (i >= videoUrls.length) return;
+        const url = videoUrls[i];
+        if (!isAllowedVideoUrl(url)) continue;
+        try {
+          const blob = await fetchVideoWithTimeout(url);
+          await addVideoBlob(threadId, i, blob, url);
+          saved++;
+          console.log('[XOE-SW] Video stored:', i, 'size:', (blob.size / 1024 / 1024).toFixed(1) + 'MB');
+        } catch (err) {
+          console.warn('[XOE-SW] Video fetch failed:', url, err.message);
+        }
+      }
+    };
+
+    const pool = [];
+    const n = Math.min(VIDEO_FETCH_CONCURRENCY, videoUrls.length);
+    for (let i = 0; i < n; i++) pool.push(worker());
+    await Promise.allSettled(pool);
+    return saved;
+  })();
+
+  inFlightVideoFetches.set(threadId, task);
+  try {
+    return await task;
+  } finally {
+    inFlightVideoFetches.delete(threadId);
+  }
 }
 
 // ─── PDF Export Handler ─────────────────────────────────────
