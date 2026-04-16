@@ -9,26 +9,49 @@
   const DEBUG = false;
   function log(...args) { if (DEBUG) console.log('[XOE]', ...args); }
 
-  console.log('[XOE] Content script loaded on', location.href);
+  if (DEBUG) log('Content script loaded on', location.href);
 
   const PROCESSED_ATTR = 'data-xoe-processed';
   const BUTTON_CLASS_PREFIX = 'xoe-';
-  const savedTweetIds = new Set();
+  // Map<tweetId, containerEl|null> — presence marks saved; value is cached container reference.
+  const savedTweetIds = new Map();
 
   const MAX_IMAGES = 50;
-  const ALLOWED_IMAGE_HOSTS = ['pbs.twimg.com', 'abs.twimg.com', 'video.twimg.com'];
-  const MAX_VIDEO_BYTES = 50 * 1024 * 1024;
   const MAX_VIDEOS_PER_THREAD = 10;
 
-  try { performance.setResourceTimingBufferSize(500); } catch {}
+  try { performance.setResourceTimingBufferSize(1000); } catch {}
+
+  // ── Video URL cache (PerformanceObserver) ────────────────
+
+  // Keeps best-resolution mp4 URL per media id, seeded by buffered entries so
+  // tweets loaded before content-script init are still resolvable.
+  const videoUrlCache = new Map(); // mediaId -> { url, res }
+  try {
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        const url = entry.name;
+        if (!url || !url.includes('video.twimg.com')) continue;
+        const m = url.match(/\/(?:ext_tw_video|amplify_video|tweet_video)\/(\d+)/);
+        if (!m) continue;
+        const mediaId = m[1];
+        const resMatch = url.match(/\/(\d+)x(\d+)\//);
+        const res = resMatch ? parseInt(resMatch[1]) * parseInt(resMatch[2]) : 1;
+        const existing = videoUrlCache.get(mediaId);
+        if (!existing || res > existing.res) {
+          videoUrlCache.set(mediaId, { url, res });
+        }
+      }
+    }).observe({ type: 'resource', buffered: true });
+  } catch {}
 
   // ── Helpers ──────────────────────────────────────────────
 
   function isAllowedImageUrl(url) {
     if (!url) return false;
     if (url.startsWith('data:image/')) return true;
-    try { return ALLOWED_IMAGE_HOSTS.includes(new URL(url).hostname); }
-    catch { return false; }
+    return url.startsWith('https://pbs.twimg.com/')
+        || url.startsWith('https://abs.twimg.com/')
+        || url.startsWith('https://video.twimg.com/');
   }
 
   function extractTweetId(articleEl) {
@@ -41,7 +64,11 @@
   }
 
   function normalizeTweetText(value) {
-    return String(value ?? '')
+    const str = String(value ?? '');
+    if (!str.includes('\n') && !str.includes('\u00a0') && !str.includes('\r')) {
+      return str.trim();
+    }
+    return str
       .replace(/\r\n/g, '\n')
       .replace(/\u00a0/g, ' ')
       .split('\n')
@@ -49,30 +76,6 @@
       .join('\n')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
-  }
-
-  function extractTweetText(articleEl) {
-    const textEl = articleEl.querySelector('[data-testid="tweetText"]');
-    if (textEl) {
-      return {
-        text: normalizeTweetText(textEl.innerText || textEl.textContent || ''),
-        textSource: 'tweetText'
-      };
-    }
-
-    const langNodes = articleEl.querySelectorAll('div[lang]');
-    const textParts = [...langNodes]
-      .map((node) => normalizeTweetText(node.innerText || node.textContent || ''))
-      .filter(Boolean);
-
-    if (textParts.length > 0) {
-      return {
-        text: [...new Set(textParts)].join('\n'),
-        textSource: 'lang'
-      };
-    }
-
-    return { text: '', textSource: 'missing' };
   }
 
   function tweetHasMedia(tweet) {
@@ -91,14 +94,53 @@
     return /\/status\/\d+/.test(location.pathname);
   }
 
-  function extractTweetData(articleEl, videoEntries = null) {
+  function extractTweetData(articleEl) {
+    // Cache hit (only reuse if video URL already resolved when hasVideo).
+    const cached = articleEl.__xoeCache;
+    if (cached && (!cached.hasVideo || cached.videoUrl)) return cached;
+
     const id = extractTweetId(articleEl);
     if (!id) return null;
 
-    const { text, textSource } = extractTweetText(articleEl);
+    // Single-sweep query — avoids 6-8 separate querySelector calls per article.
+    const nodes = articleEl.querySelectorAll('[data-testid], div[lang], time, img, video, source');
+    let tweetTextEl = null, userNameEl = null, videoPlayerEl = null, timeEl = null;
+    let videoEl = null, sourceEl = null;
+    const langNodes = [];
+    const imgs = [];
 
+    for (const node of nodes) {
+      const tag = node.tagName;
+      if (tag === 'TIME') { if (!timeEl) timeEl = node; continue; }
+      if (tag === 'IMG') { imgs.push(node); continue; }
+      if (tag === 'VIDEO') { if (!videoEl) videoEl = node; continue; }
+      if (tag === 'SOURCE') { if (!sourceEl) sourceEl = node; continue; }
+      if (tag === 'DIV' && node.hasAttribute('lang')) langNodes.push(node);
+
+      const testid = node.getAttribute('data-testid');
+      if (!testid) continue;
+      if (testid === 'tweetText' && !tweetTextEl) tweetTextEl = node;
+      else if (testid === 'User-Name' && !userNameEl) userNameEl = node;
+      else if (testid === 'videoPlayer' && !videoPlayerEl) videoPlayerEl = node;
+    }
+
+    // Text
+    let text = '', textSource = 'missing';
+    if (tweetTextEl) {
+      text = normalizeTweetText(tweetTextEl.innerText || tweetTextEl.textContent || '');
+      textSource = 'tweetText';
+    } else if (langNodes.length > 0) {
+      const parts = langNodes
+        .map((n) => normalizeTweetText(n.innerText || n.textContent || ''))
+        .filter(Boolean);
+      if (parts.length > 0) {
+        text = [...new Set(parts)].join('\n');
+        textSource = 'lang';
+      }
+    }
+
+    // Author
     let name = '', handle = '';
-    const userNameEl = articleEl.querySelector('[data-testid="User-Name"]');
     if (userNameEl) {
       const handleMatch = (userNameEl.textContent || '').match(/@([A-Za-z0-9_]+)/);
       if (handleMatch) handle = handleMatch[1];
@@ -109,58 +151,56 @@
       }
     }
 
-    const avatarImg = articleEl.querySelector(
-      'img[src*="pbs.twimg.com/profile_images"], img[src*="abs.twimg.com/sticky/default_profile_images"]'
-    );
-    const avatarUrl = avatarImg ? avatarImg.src : '';
+    // Avatar
+    let avatarUrl = '';
+    for (const img of imgs) {
+      const src = img.src || '';
+      if (src.includes('pbs.twimg.com/profile_images')
+          || src.includes('abs.twimg.com/sticky/default_profile_images')) {
+        avatarUrl = src;
+        break;
+      }
+    }
 
-    const timeEl = articleEl.querySelector('time');
     const timestamp = timeEl ? timeEl.getAttribute('datetime') : '';
 
+    // Media images (filter in JS — avoids attribute-selector regex cost).
     const images = [];
-    articleEl.querySelectorAll('img[src*="pbs.twimg.com/media"]').forEach((img) => {
-      if (!images.includes(img.src)) images.push(img.src);
-    });
+    const seenImgs = new Set();
+    for (const img of imgs) {
+      const src = img.src || '';
+      if (src.includes('pbs.twimg.com/media') && !seenImgs.has(src)) {
+        seenImgs.add(src);
+        images.push(src);
+      }
+    }
 
-    const hasVideo = !!(articleEl.querySelector('video') || articleEl.querySelector('[data-testid="videoPlayer"]'));
-    const videoUrl = hasVideo ? findVideoUrlForArticle(articleEl, videoEntries) : null;
+    const hasVideo = articleEl.dataset.xoeHasVideo === '1' || !!videoEl || !!videoPlayerEl;
+    if (hasVideo) articleEl.dataset.xoeHasVideo = '1';
 
-    return { id, text, textSource, author: { name, handle, avatarUrl }, timestamp, images, hasVideo, videoUrl };
+    const videoUrl = hasVideo ? findVideoUrlFromNodes(videoEl, sourceEl) : null;
+
+    const data = { id, text, textSource, author: { name, handle, avatarUrl }, timestamp, images, hasVideo, videoUrl };
+    articleEl.__xoeCache = data;
+    return data;
   }
 
-  function findVideoUrlForArticle(articleEl, cachedEntries = null) {
-    const videoEl = articleEl.querySelector('video');
+  function findVideoUrlFromNodes(videoEl, sourceEl) {
     if (!videoEl) return null;
 
-    // Method 1: Direct non-blob src
     if (videoEl.src && !videoEl.src.startsWith('blob:') && isAllowedImageUrl(videoEl.src)) {
       return videoEl.src;
     }
-    const sourceEl = videoEl.querySelector('source');
     if (sourceEl?.src && !sourceEl.src.startsWith('blob:') && isAllowedImageUrl(sourceEl.src)) {
       return sourceEl.src;
     }
 
-    // Method 2: Match video poster's media ID with performance entries
     const poster = videoEl.poster || '';
     const posterMatch = poster.match(/\/(ext_tw_video_thumb|tweet_video_thumb|amplify_video_thumb)\/(\d+)\//);
     if (posterMatch) {
-      const mediaId = posterMatch[2];
-      try {
-        const entries = cachedEntries || performance.getEntriesByType('resource');
-        let bestUrl = null;
-        let bestRes = 0;
-        for (const entry of entries) {
-          if (entry.name.includes('video.twimg.com') && entry.name.includes('.mp4') && entry.name.includes(mediaId)) {
-            const resMatch = entry.name.match(/\/(\d+)x(\d+)\//);
-            const res = resMatch ? parseInt(resMatch[1]) * parseInt(resMatch[2]) : 1;
-            if (res > bestRes) { bestUrl = entry.name; bestRes = res; }
-          }
-        }
-        if (bestUrl) return bestUrl;
-      } catch {}
+      const cached = videoUrlCache.get(posterMatch[2]);
+      if (cached) return cached.url;
     }
-
     return null;
   }
 
@@ -200,24 +240,22 @@
       || rootArticle.closest('[data-testid="cellInnerDiv"]')?.parentElement?.parentElement
       || document.querySelector('[data-testid="primaryColumn"]')
       || document.querySelector('[data-testid="DeckColumns"]')
-      || document.querySelector('main')
-      || document.body;
+      || document.querySelector('main');
+
+    if (!scopeRoot) {
+      const only = extractTweetData(rootArticle);
+      return only ? [only] : [];
+    }
 
     let articles = scopeRoot.querySelectorAll('article[data-testid="tweet"]');
     if (articles.length === 0) {
       articles = scopeRoot.querySelectorAll('article[role="article"]');
     }
 
-    let videoEntries = null;
-    try {
-      videoEntries = performance.getEntriesByType('resource')
-        .filter((e) => e.name && e.name.includes('video.twimg.com'));
-    } catch { videoEntries = []; }
-
     const candidates = [];
     const seen = new Set();
     for (const article of articles) {
-      const data = extractTweetData(article, videoEntries);
+      const data = extractTweetData(article);
       if (data && !seen.has(data.id)) {
         seen.add(data.id);
         candidates.push(data);
@@ -254,11 +292,6 @@
 
       log('Saving thread:', tweetId, 'tweets:', tweets.length);
 
-      // Build image URL metadata. imgIdx is per-tweet (0-based within the tweet).
-      // Service worker (task #7) fetches these URLs and writes real Blobs to
-      // the image_blobs store via addImages(threadId, [{index, blob, mimeType}]).
-      // The (tweetIdx, imgIdx) pair lets offscreen/sidepanel rebuild the same
-      // addressing used when rendering tweet.images[imgIdx].
       const imageUrls = [];
       let imgCount = 0;
       tweets.forEach((tweet, tweetIdx) => {
@@ -271,9 +304,8 @@
         });
       });
 
-      // Collect unique video URLs from tweets
       const videoUrls = [...new Set(
-        tweets.map(t => t.videoUrl).filter(u => u && isAllowedImageUrl(u))
+        tweets.map((t) => t.videoUrl).filter((u) => u && isAllowedImageUrl(u))
       )].slice(0, MAX_VIDEOS_PER_THREAD);
 
       const threadData = {
@@ -289,14 +321,14 @@
       const response = await chrome.runtime.sendMessage({ type: 'SAVE_THREAD', data: threadData });
 
       if (response && response.success) {
-        savedTweetIds.add(tweetId);
+        const container = btn.closest('.xoe-actions');
+        savedTweetIds.set(tweetId, container || null);
         if (btn.isConnected) {
           btn.classList.remove(`${BUTTON_CLASS_PREFIX}saving`);
           btn.classList.add(`${BUTTON_CLASS_PREFIX}saved`);
           if (iconEl?.isConnected) iconEl.innerHTML = ICON_CHECK;
         }
 
-        // Fetch videos in background if any
         if (videoUrls.length > 0) {
           if (labelEl?.isConnected) labelEl.textContent = '動画取得中…';
           chrome.runtime.sendMessage(
@@ -361,10 +393,11 @@
 
   // ── Button Injection ─────────────────────────────────────
 
-  function createButton(labelText, iconSvg, className, onClick) {
+  function createButton(labelText, iconSvg, className, action) {
     const btn = document.createElement('button');
     btn.className = `${BUTTON_CLASS_PREFIX}btn ${BUTTON_CLASS_PREFIX}${className}`;
     btn.type = 'button';
+    btn.dataset.xoeAction = action;
     const iconSpan = document.createElement('span');
     iconSpan.className = 'xoe-btn-icon';
     iconSpan.innerHTML = iconSvg;
@@ -373,24 +406,17 @@
     labelSpan.textContent = labelText;
     btn.appendChild(iconSpan);
     btn.appendChild(labelSpan);
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      e.preventDefault();
-      onClick();
-    });
     return btn;
   }
 
   function findActionBar(article) {
+    try {
+      const bar = article.querySelector(
+        '[role="group"]:has([data-testid="reply"], [data-testid="retweet"], [data-testid="like"], [data-testid="bookmark"])'
+      );
+      if (bar) return bar;
+    } catch {}
     const groups = article.querySelectorAll('[role="group"]');
-    for (const group of groups) {
-      if (group.querySelector('[data-testid="reply"]') ||
-          group.querySelector('[data-testid="retweet"]') ||
-          group.querySelector('[data-testid="like"]') ||
-          group.querySelector('[data-testid="bookmark"]')) {
-        return group;
-      }
-    }
     if (groups.length > 0) return groups[groups.length - 1];
     return article.querySelector('[role="toolbar"]') || null;
   }
@@ -404,6 +430,11 @@
 
     const tweetId = extractTweetId(article);
 
+    // Detect video once at injection time and stamp the article so Save path
+    // can skip a re-scan (H15).
+    const hasVideo = !!(article.querySelector('video') || article.querySelector('[data-testid="videoPlayer"]'));
+    if (hasVideo) article.dataset.xoeHasVideo = '1';
+
     const container = document.createElement('div');
     container.className = `${BUTTON_CLASS_PREFIX}actions`;
     if (tweetId) container.dataset.tweetId = tweetId;
@@ -413,19 +444,40 @@
       isSaved ? '保存済' : '保存',
       isSaved ? ICON_CHECK : ICON_BOOKMARK,
       isSaved ? 'save-btn xoe-saved' : 'save-btn',
-      () => handleSave(article, saveBtn)
+      'save'
     );
     if (isSaved) saveBtn.disabled = true;
     container.appendChild(saveBtn);
 
-    const hasVideo = !!(article.querySelector('video') || article.querySelector('[data-testid="videoPlayer"]'));
     if (hasVideo && isPiPSupported()) {
-      const pipBtn = createButton('PiP', ICON_PIP, 'pip-btn', () => handlePiP(article));
+      const pipBtn = createButton('PiP', ICON_PIP, 'pip-btn', 'pip');
       container.appendChild(pipBtn);
     }
 
     actionBar.appendChild(container);
+
+    if (tweetId && isSaved) savedTweetIds.set(tweetId, container);
   }
+
+  // ── Event Delegation (single global listener) ────────────
+
+  function globalClickHandler(e) {
+    const target = e.target;
+    if (!target || typeof target.closest !== 'function') return;
+    const btn = target.closest('.xoe-btn');
+    if (!btn) return;
+    const article = btn.closest('article');
+    if (!article) return;
+    const action = btn.dataset.xoeAction;
+    e.stopPropagation();
+    e.preventDefault();
+    if (action === 'save') {
+      handleSave(article, btn);
+    } else if (action === 'pip') {
+      handlePiP(article);
+    }
+  }
+  document.addEventListener('click', globalClickHandler, true);
 
   // ── Observer ─────────────────────────────────────────────
 
@@ -433,20 +485,39 @@
   const pendingArticles = new Set();
 
   function processInitialTweets() {
-    let articles = document.querySelectorAll(`article[data-testid="tweet"]:not([${PROCESSED_ATTR}])`);
-    if (articles.length === 0) {
-      articles = document.querySelectorAll(`article[role="article"]:not([${PROCESSED_ATTR}])`);
+    const articles = document.querySelectorAll('article[data-testid="tweet"]');
+    for (const a of articles) {
+      if (!a.hasAttribute(PROCESSED_ATTR)) injectButtons(a);
     }
-    articles.forEach((a) => injectButtons(a));
+    if (articles.length === 0) {
+      const fallback = document.querySelectorAll('article[role="article"]');
+      for (const a of fallback) {
+        if (!a.hasAttribute(PROCESSED_ATTR)) injectButtons(a);
+      }
+    }
+  }
+
+  function scheduleLowPriority(fn) {
+    if (typeof scheduler !== 'undefined' && typeof scheduler.postTask === 'function') {
+      try { scheduler.postTask(fn, { priority: 'background' }); return; } catch {}
+    }
+    if (typeof requestIdleCallback === 'function') {
+      requestIdleCallback(fn, { timeout: 500 });
+      return;
+    }
+    setTimeout(fn, 0);
   }
 
   function flushPending() {
-    pendingArticles.forEach((a) => {
-      if (a.isConnected && !a.hasAttribute(PROCESSED_ATTR)) {
-        injectButtons(a);
-      }
-    });
+    const articles = [...pendingArticles];
     pendingArticles.clear();
+    for (const a of articles) {
+      scheduleLowPriority(() => {
+        if (a.isConnected && !a.hasAttribute(PROCESSED_ATTR)) {
+          injectButtons(a);
+        }
+      });
+    }
   }
 
   function queueArticle(a) {
@@ -457,13 +528,13 @@
   const observer = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
       for (const node of mutation.addedNodes) {
-        if (node.nodeType !== 1) continue;
-        if (node.matches && node.matches('article[data-testid="tweet"]')) {
-          queueArticle(node);
-        }
-        if (node.querySelectorAll) {
-          node.querySelectorAll(`article[data-testid="tweet"]:not([${PROCESSED_ATTR}])`)
-            .forEach(queueArticle);
+        // X wraps each tweet in a DIV (cellInnerDiv). Filtering by tag cuts
+        // ~95% of mutation traffic (text nodes, style injections, etc.).
+        if (node.nodeType !== 1 || node.tagName !== 'DIV') continue;
+        if (!node.querySelectorAll) continue;
+        const articles = node.querySelectorAll('article[data-testid="tweet"]');
+        for (const a of articles) {
+          if (!a.hasAttribute(PROCESSED_ATTR)) queueArticle(a);
         }
       }
     }
@@ -472,27 +543,37 @@
     processTimer = setTimeout(flushPending, 200);
   });
 
-  function startObserving() {
+  function waitForScope() {
+    const immediate = document.querySelector('[data-testid="primaryColumn"]')
+      || document.querySelector('[data-testid="cellInnerDiv"]')?.closest('section');
+    if (immediate) return Promise.resolve(immediate);
+    return new Promise((resolve) => {
+      const mo = new MutationObserver(() => {
+        const s = document.querySelector('[data-testid="primaryColumn"]')
+          || document.querySelector('[data-testid="cellInnerDiv"]')?.closest('section');
+        if (s) { mo.disconnect(); resolve(s); }
+      });
+      mo.observe(document.documentElement, { childList: true, subtree: true });
+    });
+  }
+
+  async function startObserving() {
+    log('Waiting for primaryColumn scope');
+    const timeline = await waitForScope();
     log('Starting observer');
     processInitialTweets();
-    const timeline = document.querySelector('[data-testid="primaryColumn"]')
-                   || document.querySelector('[data-testid="DeckColumns"]')
-                   || document.querySelector('main')
-                   || document.body;
     observer.observe(timeline, { childList: true, subtree: true });
   }
 
   // ── Init ─────────────────────────────────────────────────
 
-  // IMPORTANT: Start observer FIRST, then restore saved IDs asynchronously.
-  // This ensures buttons are injected even if SW messaging fails.
+  // Start observer (awaits primaryColumn); restore saved IDs in parallel.
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => setTimeout(startObserving, 500));
+    document.addEventListener('DOMContentLoaded', () => { startObserving(); });
   } else {
-    setTimeout(startObserving, 500);
+    startObserving();
   }
 
-  // Restore saved IDs asynchronously (non-blocking)
   try {
     chrome.runtime.sendMessage({ type: 'GET_SAVED_IDS' }, (response) => {
       if (chrome.runtime.lastError) {
@@ -500,7 +581,10 @@
         return;
       }
       if (response?.success && Array.isArray(response.ids)) {
-        response.ids.forEach(id => savedTweetIds.add(String(id)));
+        for (const id of response.ids) {
+          const sid = String(id);
+          if (!savedTweetIds.has(sid)) savedTweetIds.set(sid, null);
+        }
         log('Restored', savedTweetIds.size, 'saved IDs');
       }
     });
@@ -510,24 +594,29 @@
 
   // ── Button Reset Helpers ──────────────────────────────────
 
+  function getContainer(tweetId) {
+    const cached = savedTweetIds.get(tweetId);
+    if (cached && cached.isConnected) return cached;
+    return document.querySelector(`.xoe-actions[data-tweet-id="${CSS.escape(tweetId)}"]`);
+  }
+
   function resetSaveButton(tweetId) {
+    const container = getContainer(tweetId);
     savedTweetIds.delete(tweetId);
-    const container = document.querySelector(`.xoe-actions[data-tweet-id="${CSS.escape(tweetId)}"]`);
     if (!container) return;
     const btn = container.querySelector('.xoe-save-btn');
-    if (btn) {
-      btn.classList.remove(`${BUTTON_CLASS_PREFIX}saving`, `${BUTTON_CLASS_PREFIX}saved`);
-      const label = btn.querySelector('.xoe-btn-label');
-      const icon = btn.querySelector('.xoe-btn-icon');
-      if (label) label.textContent = '保存';
-      if (icon) icon.innerHTML = ICON_BOOKMARK;
-      btn.disabled = false;
-    }
+    if (!btn) return;
+    btn.classList.remove(`${BUTTON_CLASS_PREFIX}saving`, `${BUTTON_CLASS_PREFIX}saved`);
+    const label = btn.querySelector('.xoe-btn-label');
+    const icon = btn.querySelector('.xoe-btn-icon');
+    if (label) label.textContent = '保存';
+    if (icon) icon.innerHTML = ICON_BOOKMARK;
+    btn.disabled = false;
   }
 
   function resetAllSaveButtons() {
     savedTweetIds.clear();
-    document.querySelectorAll(`.${BUTTON_CLASS_PREFIX}saved`).forEach(btn => {
+    document.querySelectorAll(`.${BUTTON_CLASS_PREFIX}saved`).forEach((btn) => {
       btn.classList.remove(`${BUTTON_CLASS_PREFIX}saved`);
       const label = btn.querySelector('.xoe-btn-label');
       const icon = btn.querySelector('.xoe-btn-icon');
@@ -541,8 +630,9 @@
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.type === 'SAVE_COMPLETE' && msg.id) {
-      savedTweetIds.add(msg.id);
-      const container = document.querySelector(`.xoe-actions[data-tweet-id="${CSS.escape(msg.id)}"]`);
+      const id = String(msg.id);
+      const container = getContainer(id);
+      savedTweetIds.set(id, container || null);
       if (container) {
         const btn = container.querySelector('.xoe-save-btn');
         if (btn) {
@@ -557,17 +647,14 @@
       }
     }
 
-    // Single thread deleted
     if (msg.type === 'THREAD_DELETED' && msg.threadId) {
       resetSaveButton(String(msg.threadId));
     }
 
-    // Batch threads deleted
     if (msg.type === 'THREADS_DELETED' && Array.isArray(msg.threadIds)) {
-      msg.threadIds.forEach(id => resetSaveButton(String(id)));
+      for (const id of msg.threadIds) resetSaveButton(String(id));
     }
 
-    // All threads deleted
     if (msg.type === 'ALL_THREADS_DELETED') {
       resetAllSaveButtons();
     }
