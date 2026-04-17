@@ -30,12 +30,14 @@ async function ensureVideoRefererRule() {
         action: {
           type: 'modifyHeaders',
           requestHeaders: [
-            { header: 'referer', operation: 'set', value: 'https://twitter.com/' },
-            { header: 'origin', operation: 'set', value: 'https://twitter.com' }
+            { header: 'referer', operation: 'set', value: 'https://twitter.com/' }
           ]
         },
         condition: {
           urlFilter: '||video.twimg.com/',
+          // tabIds: [-1] = タブ非経由 (= 拡張 service worker 発) のみ。
+          // X ページ自身の動画リクエスト (タブ発) には影響しない。
+          tabIds: [-1],
           resourceTypes: ['xmlhttprequest', 'media', 'other']
         }
       }]
