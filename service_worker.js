@@ -15,6 +15,40 @@ import { logSW } from './lib/utils-esm.js';
 
 console.log('[XOE-SW] Service worker loaded');
 
+// ─── Referer ヘッダ注入 (video.twimg.com) ────────────────────
+// 拡張の service worker から直接 fetch すると Referer が空のため、
+// X CDN が anti-hotlink で小さなスタブ(904 bytes 等)を返す。
+// DNR で extension origin → twitter.com Referer に書き換える。
+async function ensureVideoRefererRule() {
+  try {
+    const existing = await chrome.declarativeNetRequest.getSessionRules();
+    if (existing.some((r) => r.id === 1001)) return;
+    await chrome.declarativeNetRequest.updateSessionRules({
+      addRules: [{
+        id: 1001,
+        priority: 1,
+        action: {
+          type: 'modifyHeaders',
+          requestHeaders: [
+            { header: 'referer', operation: 'set', value: 'https://twitter.com/' },
+            { header: 'origin', operation: 'set', value: 'https://twitter.com' }
+          ]
+        },
+        condition: {
+          urlFilter: '||video.twimg.com/',
+          resourceTypes: ['xmlhttprequest', 'media', 'other']
+        }
+      }]
+    });
+    console.log('[XOE-SW] video.twimg.com Referer rule registered');
+  } catch (err) {
+    console.warn('[XOE-SW] DNR rule setup failed:', err?.message || err);
+  }
+}
+ensureVideoRefererRule();
+chrome.runtime.onStartup?.addListener?.(ensureVideoRefererRule);
+chrome.runtime.onInstalled?.addListener?.(ensureVideoRefererRule);
+
 // ─── Helpers ────────────────────────────────────────────────
 
 function isXUrl(url) {
@@ -458,9 +492,9 @@ async function fetchVideoWithTimeout(url, timeoutMs = VIDEO_FETCH_TIMEOUT_MS) {
     if (blob.size > MAX_VIDEO_BYTES) {
       throw new Error('video too large: ' + blob.size);
     }
-    // 空/極端に小さい応答は再生不可能 — 404 ページや空ボディを弾く
-    if (blob.size < 1024) {
-      throw new Error('video too small: ' + blob.size);
+    // 空/極端に小さい応答は再生不可能 — Referer 無しスタブ/404/空ボディを弾く
+    if (blob.size < 10240) {
+      throw new Error(`video too small: ${blob.size} bytes (url=${url})`);
     }
     return blob;
   } finally {
