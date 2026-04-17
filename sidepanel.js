@@ -18,7 +18,8 @@ import {
   searchThreads, getStorageSize,
   purgeExpiredCaches, purgeUntilUnderLimit,
   getVideosByThread, deleteVideosByThread, deleteAllVideos,
-  getImagesForThread
+  getImagesForThread,
+  exportAll, importAll
 } from './lib/db-esm.js';
 
 console.log('[XOE] Side panel module loaded');
@@ -942,6 +943,86 @@ btnDeleteSelected.addEventListener('click', deleteSelectedThreads);
 cacheLimitSelect.addEventListener('change', onSettingChange);
 cacheTTLSelect.addEventListener('change', onSettingChange);
 btnManualCleanup.addEventListener('click', onManualCleanup);
+
+// ─── Backup: Export / Import ───────────────────────────────
+const btnExportAll = document.getElementById('btn-export-all');
+const btnImportAll = document.getElementById('btn-import-all');
+const importFileInput = document.getElementById('import-file-input');
+const backupStatus = document.getElementById('backup-status');
+
+function setBackupStatus(msg) {
+  if (backupStatus) backupStatus.textContent = msg || '';
+}
+
+async function onExportAll() {
+  if (!btnExportAll) return;
+  const orig = btnExportAll.textContent;
+  btnExportAll.disabled = true;
+  btnExportAll.textContent = 'エクスポート中...';
+  setBackupStatus('');
+  try {
+    const dump = await exportAll({
+      onProgress: ({ stage, done, total }) => {
+        setBackupStatus(`${stage} ${done}/${total}`);
+      }
+    });
+    const json = JSON.stringify(dump);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    a.href = url;
+    a.download = `xoe-backup_${stamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    setBackupStatus(`完了: threads=${dump.counts.threads}, images=${dump.counts.images}, videos=${dump.counts.videos}`);
+  } catch (err) {
+    console.error('[XOE] Export failed:', err);
+    setBackupStatus('エクスポート失敗: ' + (err?.message || err));
+  } finally {
+    btnExportAll.disabled = false;
+    btnExportAll.textContent = orig;
+  }
+}
+
+function onImportAllClick() {
+  if (importFileInput) importFileInput.click();
+}
+
+async function onImportFileSelected(ev) {
+  const file = ev.target?.files?.[0];
+  if (!file) return;
+  if (!btnImportAll) return;
+  const orig = btnImportAll.textContent;
+  btnImportAll.disabled = true;
+  btnImportAll.textContent = 'インポート中...';
+  setBackupStatus('');
+  try {
+    const text = await file.text();
+    const dump = JSON.parse(text);
+    const result = await importAll(dump, {
+      onProgress: ({ stage, done, total }) => {
+        setBackupStatus(`${stage} ${done}/${total}`);
+      }
+    });
+    setBackupStatus(`復元完了: threads=${result.threads}, images=${result.images}, videos=${result.videos}`);
+    await loadThreadList();
+    await updateStorageDisplay();
+  } catch (err) {
+    console.error('[XOE] Import failed:', err);
+    setBackupStatus('インポート失敗: ' + (err?.message || err));
+  } finally {
+    btnImportAll.disabled = false;
+    btnImportAll.textContent = orig;
+    if (importFileInput) importFileInput.value = '';
+  }
+}
+
+btnExportAll?.addEventListener('click', onExportAll);
+btnImportAll?.addEventListener('click', onImportAllClick);
+importFileInput?.addEventListener('change', onImportFileSelected);
 
 // ─── Message Listener ───────────────────────────────────────
 
