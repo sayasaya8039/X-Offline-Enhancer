@@ -256,3 +256,26 @@ test('findVideoUrlFromNodes resolves a cached MP4 URL from poster thumbnails whe
     expectedUrl
   );
 });
+
+test('findVideoUrlFromNodes prefers cached MP4 variants over HLS playlist URLs', () => {
+  const harness = loadFindVideoUrlHarness();
+  const expectedUrl = 'https://video.twimg.com/ext_tw_video/222/pu/vid/640x360/clip.mp4';
+  harness.videoUrlCache.set('222', new Map([
+    [expectedUrl, { url: expectedUrl, res: 230400 }]
+  ]));
+
+  const articleEl = {
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const videoEl = {
+    currentSrc: 'https://video.twimg.com/ext_tw_video/222/pl/playlist.m3u8',
+    src: 'https://video.twimg.com/ext_tw_video/222/pl/playlist.m3u8'
+  };
+
+  assert.equal(
+    harness.findVideoUrlFromNodes(articleEl, videoEl, null, null),
+    expectedUrl
+  );
+});

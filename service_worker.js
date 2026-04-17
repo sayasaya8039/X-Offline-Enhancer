@@ -424,7 +424,12 @@ const VIDEO_FETCH_CONCURRENCY = 2;
 
 function isAllowedVideoUrl(url) {
   if (!url) return false;
-  try { return ALLOWED_VIDEO_HOSTS.includes(new URL(url).hostname); }
+  try {
+    const parsed = new URL(url);
+    return ALLOWED_VIDEO_HOSTS.includes(parsed.hostname)
+      && parsed.pathname.includes('/vid/')
+      && /\.mp4$/i.test(parsed.pathname);
+  }
   catch { return false; }
 }
 
@@ -434,6 +439,10 @@ async function fetchVideoWithTimeout(url, timeoutMs = VIDEO_FETCH_TIMEOUT_MS) {
   try {
     const resp = await fetch(url, { signal: ac.signal });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const contentType = resp.headers.get('content-type') || '';
+    if (!/^video\//i.test(contentType)) {
+      throw new Error('unexpected content-type: ' + contentType);
+    }
     // Reject before streaming the body when the server advertises a size over
     // MAX_VIDEO_BYTES. Saves us from buffering 50MB+ just to discard it.
     const cl = resp.headers.get('content-length');

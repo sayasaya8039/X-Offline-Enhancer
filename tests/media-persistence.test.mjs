@@ -77,7 +77,10 @@ function loadFetchAndStoreVideosHarness() {
       error() {}
     },
     isAllowedVideoUrl(url) {
-      return typeof url === 'string' && url.startsWith('https://video.twimg.com/');
+      return typeof url === 'string'
+        && url.startsWith('https://video.twimg.com/')
+        && url.includes('/vid/')
+        && /\.mp4(?:[?#]|$)/.test(url);
     },
     async fetchVideoWithTimeout(url) {
       attempts.push(url);
@@ -181,6 +184,24 @@ test('fetchAndStoreVideos falls back to a smaller video variant when the largest
       blob: { size: 1024, url: 'https://video.twimg.com/ext_tw_video/555/pu/vid/640x360/clip.mp4' },
       url: 'https://video.twimg.com/ext_tw_video/555/pu/vid/640x360/clip.mp4'
     }
+  ]);
+});
+
+test('fetchAndStoreVideos ignores non-MP4 playlist URLs', async () => {
+  const harness = loadFetchAndStoreVideosHarness();
+  const saved = await harness.fetchAndStoreVideos('thread-2', [
+    {
+      tweetIdx: 1,
+      urls: [
+        'https://video.twimg.com/ext_tw_video/555/pl/playlist.m3u8',
+        'https://video.twimg.com/ext_tw_video/555/pu/vid/320x180/clip.mp4'
+      ]
+    }
+  ]);
+
+  assert.equal(saved, 1);
+  assert.deepEqual(harness.attempts, [
+    'https://video.twimg.com/ext_tw_video/555/pu/vid/320x180/clip.mp4'
   ]);
 });
 
