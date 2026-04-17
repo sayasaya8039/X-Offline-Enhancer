@@ -426,9 +426,10 @@ function isAllowedVideoUrl(url) {
   if (!url) return false;
   try {
     const parsed = new URL(url);
-    return ALLOWED_VIDEO_HOSTS.includes(parsed.hostname)
-      && parsed.pathname.includes('/vid/')
-      && /\.mp4$/i.test(parsed.pathname);
+    if (!ALLOWED_VIDEO_HOSTS.includes(parsed.hostname)) return false;
+    if (!/\.mp4$/i.test(parsed.pathname)) return false;
+    // ext_tw_video / amplify_video は /vid/、tweet_video (GIF) は /tweet_video/
+    return parsed.pathname.includes('/vid/') || parsed.pathname.includes('/tweet_video/');
   }
   catch { return false; }
 }

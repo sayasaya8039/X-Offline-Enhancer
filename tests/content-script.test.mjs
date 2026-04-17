@@ -123,7 +123,7 @@ function loadFindVideoUrlHarness() {
   };
 
   vm.runInNewContext(
-    `${snippets.join('\n')}; this.findVideoUrlFromNodes = findVideoUrlFromNodes; this.findExternalVideoUrl = findExternalVideoUrl; this.findStatusVideoLink = findStatusVideoLink; this.resolveExternalVideoUrl = resolveExternalVideoUrl;`,
+    `${snippets.join('\n')}; this.findVideoUrlFromNodes = findVideoUrlFromNodes; this.findExternalVideoUrl = findExternalVideoUrl; this.findStatusVideoLink = findStatusVideoLink; this.resolveExternalVideoUrl = resolveExternalVideoUrl; this.isDirectVideoVariant = isDirectVideoVariant; this.extractVideoMediaId = extractVideoMediaId; this.rememberVideoVariant = rememberVideoVariant;`,
     context
   );
   return context;
@@ -403,4 +403,28 @@ test('buildVideoSaveEntries skips linked X video cards even when MP4 candidates 
   ]);
 
   assert.deepEqual(entries, []);
+});
+
+test('isDirectVideoVariant accepts ext_tw_video / amplify_video / tweet_video mp4 URLs', () => {
+  const harness = loadFindVideoUrlHarness();
+  assert.equal(harness.isDirectVideoVariant('https://video.twimg.com/ext_tw_video/555/pu/vid/1280x720/clip.mp4'), true);
+  assert.equal(harness.isDirectVideoVariant('https://video.twimg.com/amplify_video/777/vid/avc1/720x1280/abc.mp4?tag=16'), true);
+  assert.equal(harness.isDirectVideoVariant('https://video.twimg.com/tweet_video/FpCl3A_VsAEWhRf.mp4'), true);
+  assert.equal(harness.isDirectVideoVariant('https://video.twimg.com/ext_tw_video/555/pu/pl/playlist.m3u8'), false);
+  assert.equal(harness.isDirectVideoVariant('https://other.example.com/ext_tw_video/555/pu/vid/720x480/x.mp4'), false);
+});
+
+test('extractVideoMediaId extracts tweet_video GIF hashes and numeric IDs', () => {
+  const harness = loadFindVideoUrlHarness();
+  assert.equal(harness.extractVideoMediaId('https://video.twimg.com/ext_tw_video/9876543210/pu/vid/1280x720/clip.mp4'), '9876543210');
+  assert.equal(harness.extractVideoMediaId('https://pbs.twimg.com/amplify_video_thumb/555/img/a.jpg'), '555');
+  assert.equal(harness.extractVideoMediaId('https://video.twimg.com/tweet_video/FpCl3A_VsAEWhRf.mp4'), 'FpCl3A_VsAEWhRf');
+  assert.equal(harness.extractVideoMediaId('https://pbs.twimg.com/tweet_video_thumb/1234/img/thumb.jpg'), '1234');
+});
+
+test('rememberVideoVariant caches tweet_video GIF URLs', () => {
+  const harness = loadFindVideoUrlHarness();
+  const url = 'https://video.twimg.com/tweet_video/FpCl3A_VsAEWhRf.mp4';
+  const mediaId = harness.rememberVideoVariant(url);
+  assert.equal(mediaId, 'FpCl3A_VsAEWhRf');
 });

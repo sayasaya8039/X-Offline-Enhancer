@@ -92,8 +92,13 @@
 
   function extractVideoMediaId(url) {
     if (!url) return null;
-    const match = String(url).match(/\/(?:ext_tw_video(?:_thumb)?|amplify_video(?:_thumb)?|tweet_video(?:_thumb)?)\/(\d+)/);
-    return match ? match[1] : null;
+    const str = String(url);
+    // 数値ID系: ext_tw_video(_thumb)/ amplify_video(_thumb)/ tweet_video_thumb
+    const numeric = str.match(/\/(?:ext_tw_video(?:_thumb)?|amplify_video(?:_thumb)?|tweet_video_thumb)\/(\d+)/);
+    if (numeric) return numeric[1];
+    // tweet_video (GIF本体) はファイル名がハッシュID
+    const gif = str.match(/\/tweet_video\/([A-Za-z0-9_\-]+)\.mp4(?:[?#]|$)/);
+    return gif ? gif[1] : null;
   }
 
   function getVideoResolutionScore(url) {
@@ -103,10 +108,11 @@
   }
 
   function isDirectVideoVariant(url) {
-    return typeof url === 'string'
-      && url.startsWith('https://video.twimg.com/')
-      && url.includes('/vid/')
-      && /\.mp4(?:[?#]|$)/.test(url);
+    if (typeof url !== 'string') return false;
+    if (!url.startsWith('https://video.twimg.com/')) return false;
+    if (!/\.mp4(?:[?#]|$)/.test(url)) return false;
+    // ext_tw_video / amplify_video は /vid/ 配下、tweet_video (GIF) は /tweet_video/ 配下
+    return url.includes('/vid/') || url.includes('/tweet_video/');
   }
 
   function isFetchableVideoCandidate(url) {
@@ -359,12 +365,38 @@
     };
   }
 
+  // Pending な動画ツイートのロードを能動的にトリガー
+  // (PerformanceObserver が mp4 URL を拾えるよう、未再生動画に対し muted play → pause を実行)
+  function triggerPendingVideoLoads(pendingIds) {
+    const triggered = [];
+    document.querySelectorAll('article[data-testid="tweet"], article[role="article"]').forEach((articleEl) => {
+      const tweetId = extractTweetId(articleEl);
+      if (!tweetId || !pendingIds.has(tweetId)) return;
+      const videoEl = articleEl.querySelector('video');
+      if (!videoEl) return;
+      try {
+        videoEl.muted = true;
+        const playResult = videoEl.play();
+        triggered.push({ videoEl, playResult });
+      } catch {}
+    });
+    // 少しだけ再生してネットワーク要求を発生させ、すぐ一時停止
+    for (const { videoEl, playResult } of triggered) {
+      Promise.resolve(playResult).then(() => {
+        setTimeout(() => {
+          try { videoEl.pause(); } catch {}
+        }, 300);
+      }).catch(() => {});
+    }
+  }
+
   async function enrichPendingVideoTweets(tweets) {
     const pending = tweets.filter((tweet) => tweet?.hasVideo && (!tweet.videoCandidates || tweet.videoCandidates.length === 0));
     if (pending.length === 0) return;
 
     const pendingIds = new Set(pending.map((tweet) => tweet.id));
-    const deadline = Date.now() + 1500;
+    triggerPendingVideoLoads(pendingIds);
+    const deadline = Date.now() + 3000;
 
     while (Date.now() < deadline) {
       let updatedAny = false;
