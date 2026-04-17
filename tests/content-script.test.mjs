@@ -21,6 +21,74 @@ function loadFunctionFromContentScript(functionName) {
   return context[functionName];
 }
 
+function loadInjectButtonsHarness() {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'content_script.js'), 'utf8');
+  const match = source.match(/function injectButtons\(article\) \{[\s\S]*?\n  \}/);
+  if (!match) {
+    throw new Error('injectButtons not found in content_script.js');
+  }
+
+  const context = {
+    PROCESSED_ATTR: 'data-xoe-processed',
+    BUTTON_CLASS_PREFIX: 'xoe-',
+    savedTweetIds: new Map(),
+    ICON_CHECK: '<check />',
+    ICON_BOOKMARK: '<bookmark />',
+    ICON_PIP: '<pip />',
+    extractTweetId: () => 'tweet-1',
+    isPiPSupported: () => false,
+    createButton: (labelText, iconSvg, className, action) => ({
+      labelText,
+      iconSvg,
+      className,
+      action,
+      disabled: false
+    }),
+    document: {
+      createElement: () => ({
+        className: '',
+        dataset: {},
+        children: [],
+        appendChild(child) {
+          this.children.push(child);
+        }
+      })
+    }
+  };
+
+  vm.runInNewContext(`${match[0]}; this.injectButtons = injectButtons;`, context);
+  return context;
+}
+
+function loadObserverCallbackHarness() {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'content_script.js'), 'utf8');
+  const match = source.match(/const observer = new MutationObserver\(\(mutations\) => \{([\s\S]*?)\n  \}\);/);
+  if (!match) {
+    throw new Error('MutationObserver callback not found in content_script.js');
+  }
+
+  const body = match[1];
+  const context = {
+    PROCESSED_ATTR: 'data-xoe-processed',
+    pendingArticles: new Set(),
+    processTimer: null,
+    flushPending() {},
+    clearTimeout() {},
+    setTimeout() {
+      return 1;
+    }
+  };
+  context.queueArticle = (article) => {
+    context.pendingArticles.add(article);
+  };
+
+  vm.runInNewContext(
+    `this.runObserver = function(mutations) {${body}\n    };`,
+    context
+  );
+  return context;
+}
+
 test('extractTweetId prefers the article permalink over quoted tweet links', () => {
   const extractTweetId = loadFunctionFromContentScript('extractTweetId');
 
@@ -65,4 +133,65 @@ test('extractTweetId falls back to the first status link when no permalink time 
   };
 
   assert.equal(extractTweetId(articleEl), '3333333333333333333');
+});
+
+test('injectButtons leaves articles retryable until the action bar exists', () => {
+  const harness = loadInjectButtonsHarness();
+  let actionBar = null;
+  const appended = [];
+  harness.findActionBar = () => actionBar;
+
+  const article = {
+    attrs: new Set(),
+    dataset: {},
+    hasAttribute(name) {
+      return this.attrs.has(name);
+    },
+    setAttribute(name) {
+      this.attrs.add(name);
+    },
+    querySelector() {
+      return null;
+    }
+  };
+
+  harness.injectButtons(article);
+  assert.equal(article.hasAttribute('data-xoe-processed'), false);
+
+  actionBar = {
+    appendChild(node) {
+      appended.push(node);
+    }
+  };
+
+  harness.injectButtons(article);
+  assert.equal(article.hasAttribute('data-xoe-processed'), true);
+  assert.equal(appended.length, 1);
+  assert.equal(appended[0].className, 'xoe-actions');
+});
+
+test('observer re-queues the existing article when late action-bar nodes are added inside it', () => {
+  const harness = loadObserverCallbackHarness();
+  const article = {
+    id: 'tweet-article',
+    hasAttribute() {
+      return false;
+    }
+  };
+  const addedNode = {
+    nodeType: 1,
+    tagName: 'DIV',
+    querySelectorAll(selector) {
+      assert.equal(selector, 'article[data-testid="tweet"], article[role="article"]');
+      return [];
+    },
+    closest(selector) {
+      assert.equal(selector, 'article[data-testid="tweet"], article[role="article"]');
+      return article;
+    }
+  };
+
+  harness.runObserver([{ addedNodes: [addedNode] }]);
+
+  assert.equal(harness.pendingArticles.has(article), true);
 });

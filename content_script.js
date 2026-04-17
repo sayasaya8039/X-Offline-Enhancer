@@ -430,7 +430,6 @@
 
   function injectButtons(article) {
     if (article.hasAttribute(PROCESSED_ATTR)) return;
-    article.setAttribute(PROCESSED_ATTR, 'true');
 
     const actionBar = findActionBar(article);
     if (!actionBar) return;
@@ -462,6 +461,7 @@
     }
 
     actionBar.appendChild(container);
+    article.setAttribute(PROCESSED_ATTR, 'true');
 
     if (tweetId && isSaved) savedTweetIds.set(tweetId, container);
   }
@@ -535,11 +535,14 @@
   const observer = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
       for (const node of mutation.addedNodes) {
-        // X wraps each tweet in a DIV (cellInnerDiv). Filtering by tag cuts
-        // ~95% of mutation traffic (text nodes, style injections, etc.).
-        if (node.nodeType !== 1 || node.tagName !== 'DIV') continue;
-        if (!node.querySelectorAll) continue;
-        const articles = node.querySelectorAll('article[data-testid="tweet"]');
+        if (node.nodeType !== 1 || !node.querySelectorAll) continue;
+        const ancestorArticle = typeof node.closest === 'function'
+          ? node.closest('article[data-testid="tweet"], article[role="article"]')
+          : null;
+        if (ancestorArticle && !ancestorArticle.hasAttribute(PROCESSED_ATTR)) {
+          queueArticle(ancestorArticle);
+        }
+        const articles = node.querySelectorAll('article[data-testid="tweet"], article[role="article"]');
         for (const a of articles) {
           if (!a.hasAttribute(PROCESSED_ATTR)) queueArticle(a);
         }
