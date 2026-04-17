@@ -44,6 +44,28 @@
         || url.startsWith('https://video.twimg.com/');
   }
 
+  function isExternalVideoUrl(url) {
+    if (!url) return false;
+    try {
+      const host = new URL(url).hostname.replace(/^www\./, '').toLowerCase();
+      return host === 'youtube.com'
+        || host === 'm.youtube.com'
+        || host === 'youtu.be'
+        || host === 'youtube-nocookie.com';
+    } catch {
+      return false;
+    }
+  }
+
+  function findExternalVideoUrl(articleEl) {
+    if (!articleEl?.querySelectorAll) return null;
+    for (const link of articleEl.querySelectorAll('a[href]')) {
+      const href = link?.href || '';
+      if (isExternalVideoUrl(href)) return href;
+    }
+    return null;
+  }
+
   function extractVideoMediaId(url) {
     if (!url) return null;
     const match = String(url).match(/\/(?:ext_tw_video(?:_thumb)?|amplify_video(?:_thumb)?|tweet_video(?:_thumb)?)\/(\d+)/);
@@ -228,6 +250,13 @@
     const videoDetails = hasVideo
       ? findVideoDetailsFromNodes(articleEl, videoEl, sourceEl, videoPlayerEl)
       : { videoUrl: null, videoMediaId: null, videoCandidates: [] };
+    const hasNativeVideoCandidate = [
+      videoDetails.videoUrl,
+      ...(videoDetails.videoCandidates || [])
+    ].some((url) => isFetchableVideoCandidate(url));
+    const externalVideoUrl = hasVideo && !hasNativeVideoCandidate
+      ? findExternalVideoUrl(articleEl)
+      : null;
 
     const data = {
       id,
@@ -239,7 +268,8 @@
       hasVideo,
       videoUrl: videoDetails.videoUrl,
       videoMediaId: videoDetails.videoMediaId,
-      videoCandidates: videoDetails.videoCandidates
+      videoCandidates: videoDetails.videoCandidates,
+      externalVideoUrl
     };
     articleEl.__xoeCache = data;
     return data;
@@ -338,6 +368,35 @@
         await new Promise((resolve) => setTimeout(resolve, 150));
       }
     }
+  }
+
+  function buildVideoSaveEntries(tweets) {
+    return tweets
+      .map((tweet, tweetIdx) => {
+        if (tweet.externalVideoUrl) return null;
+
+        const candidates = [];
+        const pushCandidate = (url) => {
+          if (url && isFetchableVideoCandidate(url) && !candidates.includes(url)) {
+            candidates.push(url);
+          }
+        };
+
+        (tweet.videoCandidates || []).forEach(pushCandidate);
+        if ((!tweet.videoCandidates || tweet.videoCandidates.length === 0) && tweet.videoMediaId) {
+          getVideoCandidatesForMediaId(tweet.videoMediaId).forEach(pushCandidate);
+        }
+        pushCandidate(tweet.videoUrl);
+
+        if (!tweet.hasVideo || candidates.length === 0) return null;
+        return {
+          tweetIdx,
+          mediaId: tweet.videoMediaId || null,
+          urls: candidates.slice(0, MAX_VIDEOS_PER_THREAD)
+        };
+      })
+      .filter(Boolean)
+      .slice(0, MAX_VIDEOS_PER_THREAD);
   }
 
   function selectThreadTweets(candidates, clickedTweetId, options = {}) {
@@ -442,30 +501,7 @@
         });
       });
 
-      const videoEntries = tweets
-        .map((tweet, tweetIdx) => {
-          const candidates = [];
-          const pushCandidate = (url) => {
-            if (url && isFetchableVideoCandidate(url) && !candidates.includes(url)) {
-              candidates.push(url);
-            }
-          };
-
-          (tweet.videoCandidates || []).forEach(pushCandidate);
-          if ((!tweet.videoCandidates || tweet.videoCandidates.length === 0) && tweet.videoMediaId) {
-            getVideoCandidatesForMediaId(tweet.videoMediaId).forEach(pushCandidate);
-          }
-          pushCandidate(tweet.videoUrl);
-
-          if (!tweet.hasVideo || candidates.length === 0) return null;
-          return {
-            tweetIdx,
-            mediaId: tweet.videoMediaId || null,
-            urls: candidates.slice(0, MAX_VIDEOS_PER_THREAD)
-          };
-        })
-        .filter(Boolean)
-        .slice(0, MAX_VIDEOS_PER_THREAD);
+      const videoEntries = buildVideoSaveEntries(tweets);
 
       const threadData = {
         id: tweetId,

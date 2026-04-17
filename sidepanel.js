@@ -678,6 +678,22 @@ function buildTweetArticle(tweet, tweetIdx, cache, imageBlobMap, videoBlobMap, f
       if (imagesDiv.children.length > 0) tweetDiv.appendChild(imagesDiv);
     }
 
+    if (tweet.externalVideoUrl) {
+      const notice = document.createElement('div');
+      notice.className = 'reader-video-notice';
+      notice.textContent = '外部動画（YouTube 等）はオフライン保存できません。';
+      tweetDiv.appendChild(notice);
+
+      const link = document.createElement('a');
+      link.className = 'reader-video-link';
+      link.href = tweet.externalVideoUrl;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = '元の動画を開く';
+      tweetDiv.appendChild(link);
+      return;
+    }
+
     const videoSrc = resolveVideoSrc({
       tweet,
       tweetIdx,

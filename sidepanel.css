@@ -888,3 +888,15 @@ body {
   border-radius: var(--radius);
   text-align: center;
 }
+
+.reader-video-link {
+  display: inline-block;
+  margin-top: 8px;
+  color: var(--accent);
+  font-size: 13px;
+  text-decoration: none;
+}
+
+.reader-video-link:hover {
+  text-decoration: underline;
+}

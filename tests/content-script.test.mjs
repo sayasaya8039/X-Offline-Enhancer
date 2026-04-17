@@ -92,6 +92,8 @@ function loadObserverCallbackHarness() {
 function loadFindVideoUrlHarness() {
   const source = fs.readFileSync(path.join(__dirname, '..', 'content_script.js'), 'utf8');
   const snippets = [
+    /function isExternalVideoUrl\([^)]*\) \{[\s\S]*?\n  \}/,
+    /function findExternalVideoUrl\([^)]*\) \{[\s\S]*?\n  \}/,
     /function extractVideoMediaId\([^)]*\) \{[\s\S]*?\n  \}/,
     /function getVideoResolutionScore\([^)]*\) \{[\s\S]*?\n  \}/,
     /function isDirectVideoVariant\([^)]*\) \{[\s\S]*?\n  \}/,
@@ -111,13 +113,39 @@ function loadFindVideoUrlHarness() {
   }
 
   const context = {
+    URL,
     videoUrlCache: new Map(),
     isAllowedImageUrl(url) {
       return typeof url === 'string' && (url.startsWith('https://video.twimg.com/') || url.startsWith('https://pbs.twimg.com/'));
     }
   };
 
-  vm.runInNewContext(`${snippets.join('\n')}; this.findVideoUrlFromNodes = findVideoUrlFromNodes;`, context);
+  vm.runInNewContext(
+    `${snippets.join('\n')}; this.findVideoUrlFromNodes = findVideoUrlFromNodes; this.findExternalVideoUrl = findExternalVideoUrl;`,
+    context
+  );
+  return context;
+}
+
+function loadBuildVideoEntriesHarness() {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'content_script.js'), 'utf8');
+  const snippets = [
+    /const MAX_VIDEOS_PER_THREAD = \d+;/,
+    /function isFetchableVideoCandidate\([^)]*\) \{[\s\S]*?\n  \}/,
+    /function getVideoCandidatesForMediaId\([^)]*\) \{[\s\S]*?\n  \}/,
+    /function buildVideoSaveEntries\([^)]*\) \{[\s\S]*?\n  \}/
+  ].map((pattern) => {
+    const match = source.match(pattern);
+    if (!match) {
+      throw new Error(`Required buildVideoSaveEntries dependency not found: ${pattern}`);
+    }
+    return match[0];
+  });
+
+  const context = {
+    videoUrlCache: new Map()
+  };
+  vm.runInNewContext(`${snippets.join('\n')}; this.buildVideoSaveEntries = buildVideoSaveEntries;`, context);
   return context;
 }
 
@@ -278,4 +306,38 @@ test('findVideoUrlFromNodes prefers cached MP4 variants over HLS playlist URLs',
     harness.findVideoUrlFromNodes(articleEl, videoEl, null, null),
     expectedUrl
   );
+});
+
+test('findExternalVideoUrl detects YouTube links inside the tweet article', () => {
+  const harness = loadFindVideoUrlHarness();
+  const articleEl = {
+    querySelectorAll(selector) {
+      assert.equal(selector, 'a[href]');
+      return [
+        { href: 'https://x.com/worldofai/status/123' },
+        { href: 'https://youtu.be/lzdmb_Z-yZc' }
+      ];
+    }
+  };
+
+  assert.equal(
+    harness.findExternalVideoUrl(articleEl),
+    'https://youtu.be/lzdmb_Z-yZc'
+  );
+});
+
+test('buildVideoSaveEntries skips external YouTube embeds even when preview candidates exist', () => {
+  const harness = loadBuildVideoEntriesHarness();
+  const entries = harness.buildVideoSaveEntries([
+    {
+      id: 'tweet-1',
+      hasVideo: true,
+      externalVideoUrl: 'https://youtu.be/lzdmb_Z-yZc',
+      videoCandidates: ['https://video.twimg.com/ext_tw_video/555/pu/vid/640x360/clip.mp4'],
+      videoMediaId: '555',
+      videoUrl: 'https://video.twimg.com/ext_tw_video/555/pu/vid/640x360/clip.mp4'
+    }
+  ]);
+
+  assert.deepEqual(entries, []);
 });
