@@ -377,7 +377,8 @@ async function handleMessage(message, sender) {
       if (!threadId || !Array.isArray(videoUrls)) {
         throw new Error('Invalid FETCH_VIDEOS params');
       }
-      const saved = await fetchAndStoreVideos(threadId, videoUrls);
+      const senderTabId = sender?.tab?.id ?? null;
+      const saved = await fetchAndStoreVideos(threadId, videoUrls, senderTabId);
       if (saved > 0) {
         broadcastToExtension({ type: 'VIDEOS_SAVED', threadId, saved });
       }
@@ -526,9 +527,24 @@ function normalizeVideoEntries(videoUrls) {
 // calls from racing and double-storing identical blobs.
 const inFlightVideoFetches = new Map();
 
-async function fetchAndStoreVideos(threadId, videoUrls) {
+// Content Script (ページ内コンテキスト) 経由で動画 fetch するフォールバック。
+// SW 直 fetch が X CDN の hotlink 保護で失敗した場合に使用。
+async function fetchVideoViaContentScript(url, tabId) {
+  if (tabId == null || tabId < 0) throw new Error('no tab id for CS fetch');
+  const resp = await chrome.tabs.sendMessage(tabId, { type: 'FETCH_VIDEO_VIA_PAGE', url });
+  if (!resp || !resp.ok) {
+    throw new Error('CS fetch failed: ' + (resp?.error || 'no response'));
+  }
+  const binary = atob(resp.base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: resp.contentType || 'video/mp4' });
+}
+
+async function fetchAndStoreVideos(threadId, videoUrls, tabId = null) {
   const entries = normalizeVideoEntries(videoUrls);
   if (entries.length === 0) return 0;
+  console.log('[XOE-SW] fetchAndStoreVideos start', { threadId, entries: entries.length, tabId });
 
   const existing = inFlightVideoFetches.get(threadId);
   if (existing) return existing;
@@ -543,14 +559,31 @@ async function fetchAndStoreVideos(threadId, videoUrls) {
         if (i >= entries.length) return;
         const entry = entries[i];
         for (const url of entry.urls) {
+          let blob = null;
+          // 1st: SW fetch (DNR で Referer 注入済み)
           try {
-            const blob = await fetchVideoWithTimeout(url);
-            await addVideoBlob(threadId, entry.index, blob, url);
-            saved++;
-            console.log('[XOE-SW] Video stored:', entry.index, 'size:', (blob.size / 1024 / 1024).toFixed(1) + 'MB');
-            break;
+            blob = await fetchVideoWithTimeout(url);
           } catch (err) {
-            console.warn('[XOE-SW] Video fetch failed:', url, err.message);
+            console.warn('[XOE-SW] SW fetch failed:', url, err.message);
+          }
+          // 2nd: Content Script 経由 fetch (ページ context = 正規の Referer/Cookie)
+          if (!blob && tabId != null) {
+            try {
+              blob = await fetchVideoViaContentScript(url, tabId);
+              console.log('[XOE-SW] CS fetch succeeded:', url, (blob.size / 1024 / 1024).toFixed(1) + 'MB');
+            } catch (err) {
+              console.warn('[XOE-SW] CS fetch failed:', url, err.message);
+            }
+          }
+          if (blob) {
+            try {
+              await addVideoBlob(threadId, entry.index, blob, url);
+              saved++;
+              console.log('[XOE-SW] Video stored:', entry.index, 'size:', (blob.size / 1024 / 1024).toFixed(1) + 'MB');
+              break;
+            } catch (err) {
+              console.warn('[XOE-SW] addVideoBlob failed:', url, err.message);
+            }
           }
         }
       }

@@ -909,4 +909,36 @@
       resetAllSaveButtons();
     }
   });
+
+  // ── Page-context Video Fetch (anti-hotlink bypass) ──────────
+  //
+  // Service Worker からの fetch は Referer/Cookie が無いため X CDN が
+  // スタブ応答 (904 bytes 等) を返す。ページ内 fetch はブラウザが自動で
+  // Referer=https://x.com/, Origin=https://x.com, Cookie を付与するため
+  // 正規 player と同じリクエストとして扱われる。
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg?.type !== 'FETCH_VIDEO_VIA_PAGE') return;
+    (async () => {
+      try {
+        const resp = await fetch(msg.url, { credentials: 'include' });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const ct = resp.headers.get('content-type') || '';
+        if (!/^video\//i.test(ct)) throw new Error('unexpected content-type: ' + ct);
+        const buf = await resp.arrayBuffer();
+        if (buf.byteLength < 10240) throw new Error('response too small: ' + buf.byteLength);
+        // ArrayBuffer を base64 文字列に変換 (chrome.runtime message は JSON 限定)
+        const bytes = new Uint8Array(buf);
+        let binary = '';
+        const chunkSize = 0x8000; // 32KB ずつ fromCharCode (stack overflow 回避)
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+        }
+        const base64 = btoa(binary);
+        sendResponse({ ok: true, base64, contentType: ct, size: buf.byteLength });
+      } catch (err) {
+        sendResponse({ ok: false, error: err?.message || String(err) });
+      }
+    })();
+    return true; // async response
+  });
 })();

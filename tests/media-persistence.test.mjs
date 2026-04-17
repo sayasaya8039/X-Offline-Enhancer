@@ -61,7 +61,7 @@ function loadHandleMessageHarness() {
 function loadFetchAndStoreVideosHarness() {
   const source = fs.readFileSync(path.join(__dirname, '..', 'service_worker.js'), 'utf8');
   const normalizeMatch = source.match(/function normalizeVideoEntries\(videoUrls\) \{[\s\S]*?\n\}/);
-  const fetchMatch = source.match(/async function fetchAndStoreVideos\(threadId, videoUrls\) \{[\s\S]*?\n\}/);
+  const fetchMatch = source.match(/async function fetchAndStoreVideos\(threadId, videoUrls[^)]*\) \{[\s\S]*?\n\}/);
   if (!normalizeMatch || !fetchMatch) {
     throw new Error('video helpers not found in service_worker.js');
   }
