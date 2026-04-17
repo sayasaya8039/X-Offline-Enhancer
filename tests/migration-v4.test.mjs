@@ -157,6 +157,8 @@ test('v3 → v4 migration backfills searchTokens and summary on existing threads
         );
         assert.ok(rec.summary, `${rec.id} should have summary`);
         assert.equal(typeof rec.summary.primaryText, 'string');
+        assert.equal(typeof rec.summary.primaryAuthor, 'object');
+        assert.equal(typeof rec.summary.primaryAuthor.handle, 'string');
       }
 
       const videos = await getAllFromStore(db, 'video_blobs');
@@ -179,6 +181,53 @@ test('v3 → v4 migration backfills searchTokens and summary on existing threads
     } finally {
       db.close();
     }
+  } finally {
+    removeChromeMock();
+  }
+});
+
+test('getAllThreadsMeta normalizes legacy summary author info and preserves timestamp for list cards', async () => {
+  await deleteDb();
+  const calls = installChromeMock();
+  try {
+    const mod = await freshModule();
+    const thread = {
+      id: 'legacy-1',
+      timestamp: 1710000000000,
+      tags: ['saved'],
+      tweets: [
+        {
+          id: 'tweet-1',
+          text: 'hello world',
+          images: [],
+          hasVideo: false,
+          author: {
+            name: 'Alice',
+            handle: 'alice',
+            avatarUrl: 'https://pbs.twimg.com/profile_images/example.jpg'
+          }
+        }
+      ],
+      summary: {
+        primaryAuthor: 'alice',
+        primaryText: 'hello world',
+        imageCount: 0,
+        videoCount: 0
+      },
+      searchTokens: ['alice', 'hello']
+    };
+
+    await mod.addThread(thread);
+
+    const metas = await mod.getAllThreadsMeta();
+    assert.equal(metas.length, 1);
+    assert.equal(metas[0].timestamp, 1710000000000);
+    assert.deepEqual(metas[0].summary.primaryAuthor, {
+      name: 'Alice',
+      handle: 'alice',
+      avatarUrl: 'https://pbs.twimg.com/profile_images/example.jpg'
+    });
+    assert.equal(calls.length, 0);
   } finally {
     removeChromeMock();
   }
