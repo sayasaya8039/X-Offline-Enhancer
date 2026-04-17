@@ -51,15 +51,38 @@ ensureVideoRefererRule();
 chrome.runtime.onStartup?.addListener?.(ensureVideoRefererRule);
 chrome.runtime.onInstalled?.addListener?.(ensureVideoRefererRule);
 
+// ─── Persistent Storage 要求 ─────────────────────────────────
+// Chrome がストレージ圧迫時に IndexedDB を勝手に退避するのを防ぐ。
+// persisted() が true になれば保存データはユーザが明示的に削除するまで残る。
+async function ensurePersistentStorage() {
+  try {
+    if (!navigator.storage?.persist) return;
+    const already = await navigator.storage.persisted();
+    if (already) {
+      console.log('[XOE-SW] storage already persistent');
+      return;
+    }
+    const ok = await navigator.storage.persist();
+    console.log('[XOE-SW] storage.persist() ->', ok);
+  } catch (err) {
+    console.warn('[XOE-SW] storage.persist failed:', err?.message || err);
+  }
+}
+ensurePersistentStorage();
+chrome.runtime.onStartup?.addListener?.(ensurePersistentStorage);
+chrome.runtime.onInstalled?.addListener?.(ensurePersistentStorage);
+
 // ─── Helpers ────────────────────────────────────────────────
 
 function isXUrl(url) {
   return url && (url.startsWith('https://twitter.com') || url.startsWith('https://x.com') || url.startsWith('https://pro.x.com'));
 }
 
+// 永続保存を優先: 自動削除は無効 (0 = 無制限/無期限)。ユーザが明示的に
+// 設定 UI で変更した場合のみ cleanup が走る。
 const DEFAULT_CACHE_SETTINGS = {
-  cacheLimitMB: 200,
-  cacheTTLDays: 30
+  cacheLimitMB: 0,
+  cacheTTLDays: 0
 };
 
 async function getCacheSettings() {

@@ -9,6 +9,7 @@ import { isAllowedImageUrl } from './lib/utils-esm.js';
 import {
   buildImageBlobUrlMap,
   resolveImageSrc,
+  resolveAvatarSrc,
   buildVideoBlobMaps,
   resolveVideoSrc
 } from './lib/reader-media.mjs';
@@ -52,8 +53,8 @@ let threadSavedTimer = null;
 // ─── Cache Settings ─────────────────────────────────────────
 
 const DEFAULT_CACHE_SETTINGS = {
-  cacheLimitMB: 200,
-  cacheTTLDays: 30
+  cacheLimitMB: 0,
+  cacheTTLDays: 0
 };
 
 async function getCacheSettings() {
@@ -772,7 +773,12 @@ async function openReaderView(threadId) {
   const firstTweet = pickPrimaryTweet(thread);
   const author = (firstTweet && firstTweet.author) || {};
   const cache = thread.imageCache || {};
-  const avatarSrc = cache[author.avatarUrl] || author.avatarUrl || '';
+  const avatarSrc = resolveAvatarSrc({
+    avatarUrl: author.avatarUrl,
+    avatarIndex: thread.avatarIndex,
+    imageBlobMap,
+    legacyCache: cache
+  });
 
   const authorDiv = document.createElement('div');
   authorDiv.className = 'reader-author';

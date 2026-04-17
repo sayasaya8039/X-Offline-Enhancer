@@ -590,6 +590,20 @@
         });
       });
 
+      // 永続保存: アバター画像も blob として保存 (X が URL を変えても残る)。
+      // tweetIdx=-1, imgIdx=連番 で image_blobs に格納し、
+      // avatarIndex[avatarUrl] = imgIdx で参照を保持。
+      const avatarIndex = {};
+      let avatarSeq = 0;
+      tweets.forEach((tweet) => {
+        const url = tweet?.author?.avatarUrl;
+        if (!url || avatarIndex[url] !== undefined) return;
+        if (!isAllowedImageUrl(url)) return;
+        avatarIndex[url] = avatarSeq;
+        imageUrls.push({ tweetIdx: -1, imgIdx: avatarSeq, url });
+        avatarSeq++;
+      });
+
       const videoEntries = buildVideoSaveEntries(tweets);
 
       const threadData = {
@@ -598,6 +612,7 @@
         tweets,
         imageUrls,
         videoUrls: videoEntries,
+        avatarIndex,
         timestamp: Date.now(),
         tags: []
       };
