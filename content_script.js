@@ -48,8 +48,7 @@
     if (!url) return false;
     try {
       const host = new URL(url).hostname.replace(/^www\./, '').toLowerCase();
-      return host === 't.co'
-        || host === 'youtube.com'
+      return host === 'youtube.com'
         || host === 'm.youtube.com'
         || host === 'youtu.be'
         || host === 'youtube-nocookie.com';
@@ -67,9 +66,27 @@
     return null;
   }
 
-  function resolveExternalVideoUrl(articleEl, videoEl, sourceEl, videoPlayerEl) {
+  function findStatusVideoLink(articleEl) {
+    if (!articleEl?.querySelectorAll) return null;
+    for (const link of articleEl.querySelectorAll('a[href]')) {
+      const href = link?.href || '';
+      const match = href.match(/\/status\/(\d+)\/video\/\d+/);
+      if (match) {
+        return { href, tweetId: match[1] };
+      }
+    }
+    return null;
+  }
+
+  function resolveExternalVideoUrl(articleEl, currentTweetId, videoEl, sourceEl, videoPlayerEl) {
     if (!videoPlayerEl) return null;
     if (videoEl || sourceEl) return null;
+    const statusVideoLink = findStatusVideoLink(articleEl);
+    if (statusVideoLink) {
+      return String(statusVideoLink.tweetId) === String(currentTweetId)
+        ? null
+        : statusVideoLink.href;
+    }
     return findExternalVideoUrl(articleEl);
   }
 
@@ -258,7 +275,7 @@
       ? findVideoDetailsFromNodes(articleEl, videoEl, sourceEl, videoPlayerEl)
       : { videoUrl: null, videoMediaId: null, videoCandidates: [] };
     const externalVideoUrl = hasVideo
-      ? resolveExternalVideoUrl(articleEl, videoEl, sourceEl, videoPlayerEl)
+      ? resolveExternalVideoUrl(articleEl, id, videoEl, sourceEl, videoPlayerEl)
       : null;
 
     const data = {

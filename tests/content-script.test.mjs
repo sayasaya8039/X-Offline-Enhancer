@@ -94,6 +94,7 @@ function loadFindVideoUrlHarness() {
   const snippets = [
     /function isExternalVideoUrl\([^)]*\) \{[\s\S]*?\n  \}/,
     /function findExternalVideoUrl\([^)]*\) \{[\s\S]*?\n  \}/,
+    /function findStatusVideoLink\([^)]*\) \{[\s\S]*?\n  \}/,
     /function resolveExternalVideoUrl\([^)]*\) \{[\s\S]*?\n  \}/,
     /function extractVideoMediaId\([^)]*\) \{[\s\S]*?\n  \}/,
     /function getVideoResolutionScore\([^)]*\) \{[\s\S]*?\n  \}/,
@@ -122,7 +123,7 @@ function loadFindVideoUrlHarness() {
   };
 
   vm.runInNewContext(
-    `${snippets.join('\n')}; this.findVideoUrlFromNodes = findVideoUrlFromNodes; this.findExternalVideoUrl = findExternalVideoUrl; this.resolveExternalVideoUrl = resolveExternalVideoUrl;`,
+    `${snippets.join('\n')}; this.findVideoUrlFromNodes = findVideoUrlFromNodes; this.findExternalVideoUrl = findExternalVideoUrl; this.findStatusVideoLink = findStatusVideoLink; this.resolveExternalVideoUrl = resolveExternalVideoUrl;`,
     context
   );
   return context;
@@ -327,39 +328,48 @@ test('findExternalVideoUrl detects YouTube links inside the tweet article', () =
   );
 });
 
-test('findExternalVideoUrl treats t.co media card links as external video sources', () => {
+test('findStatusVideoLink returns linked X video tweet ids from status video anchors', () => {
   const harness = loadFindVideoUrlHarness();
   const articleEl = {
     querySelectorAll(selector) {
       assert.equal(selector, 'a[href]');
       return [
         { href: 'https://x.com/ClaudeCode_love/status/1912345678901234567' },
-        { href: 'https://t.co/abcdef1234' }
+        { href: 'https://twitter.com/berryxia/status/2044929458419937462/video/1' }
       ];
     }
   };
 
-  assert.equal(
-    harness.findExternalVideoUrl(articleEl),
-    'https://t.co/abcdef1234'
-  );
+  const result = harness.findStatusVideoLink(articleEl);
+  assert.equal(result.href, 'https://twitter.com/berryxia/status/2044929458419937462/video/1');
+  assert.equal(result.tweetId, '2044929458419937462');
 });
 
-test('resolveExternalVideoUrl prefers external card links only when no native video element exists', () => {
+test('resolveExternalVideoUrl ignores same-tweet X video links and keeps native video eligible', () => {
   const harness = loadFindVideoUrlHarness();
   const articleEl = {
     querySelectorAll() {
-      return [{ href: 'https://t.co/abcdef1234' }];
+      return [{ href: 'https://twitter.com/berryxia/status/2044929458419937462/video/1' }];
     }
   };
 
   assert.equal(
-    harness.resolveExternalVideoUrl(articleEl, null, null, { nodeName: 'DIV' }),
-    'https://t.co/abcdef1234'
-  );
-  assert.equal(
-    harness.resolveExternalVideoUrl(articleEl, { nodeName: 'VIDEO' }, null, { nodeName: 'DIV' }),
+    harness.resolveExternalVideoUrl(articleEl, '2044929458419937462', null, null, { nodeName: 'DIV' }),
     null
+  );
+});
+
+test('resolveExternalVideoUrl treats different-tweet X video cards as external media', () => {
+  const harness = loadFindVideoUrlHarness();
+  const articleEl = {
+    querySelectorAll() {
+      return [{ href: 'https://x.com/kirillk_web3/status/2043037616979759465/video/1' }];
+    }
+  };
+
+  assert.equal(
+    harness.resolveExternalVideoUrl(articleEl, '1912345678901234567', null, null, { nodeName: 'DIV' }),
+    'https://x.com/kirillk_web3/status/2043037616979759465/video/1'
   );
 });
 
@@ -379,13 +389,13 @@ test('buildVideoSaveEntries skips external YouTube embeds even when preview cand
   assert.deepEqual(entries, []);
 });
 
-test('buildVideoSaveEntries skips t.co media card previews even when MP4 candidates exist', () => {
+test('buildVideoSaveEntries skips linked X video cards even when MP4 candidates exist', () => {
   const harness = loadBuildVideoEntriesHarness();
   const entries = harness.buildVideoSaveEntries([
     {
       id: 'tweet-2',
       hasVideo: true,
-      externalVideoUrl: 'https://t.co/abcdef1234',
+      externalVideoUrl: 'https://x.com/kirillk_web3/status/2043037616979759465/video/1',
       videoCandidates: ['https://video.twimg.com/ext_tw_video/777/pu/vid/640x360/clip.mp4'],
       videoMediaId: '777',
       videoUrl: 'https://video.twimg.com/ext_tw_video/777/pu/vid/640x360/clip.mp4'
