@@ -23,23 +23,13 @@
 
   // ── Video URL cache (PerformanceObserver) ────────────────
 
-  // Keeps best-resolution mp4 URL per media id, seeded by buffered entries so
-  // tweets loaded before content-script init are still resolvable.
-  const videoUrlCache = new Map(); // mediaId -> { url, res }
+  // Keeps all discovered mp4 variants per media id so save logic can fall back
+  // to lower resolutions when larger variants exceed the IndexedDB size budget.
+  const videoUrlCache = new Map(); // mediaId -> Map<url, { url, res }>
   try {
     new PerformanceObserver((list) => {
       for (const entry of list.getEntries()) {
-        const url = entry.name;
-        if (!url || !url.includes('video.twimg.com')) continue;
-        const m = url.match(/\/(?:ext_tw_video|amplify_video|tweet_video)\/(\d+)/);
-        if (!m) continue;
-        const mediaId = m[1];
-        const resMatch = url.match(/\/(\d+)x(\d+)\//);
-        const res = resMatch ? parseInt(resMatch[1]) * parseInt(resMatch[2]) : 1;
-        const existing = videoUrlCache.get(mediaId);
-        if (!existing || res > existing.res) {
-          videoUrlCache.set(mediaId, { url, res });
-        }
+        rememberVideoVariant(entry.name);
       }
     }).observe({ type: 'resource', buffered: true });
   } catch {}
@@ -52,6 +42,52 @@
     return url.startsWith('https://pbs.twimg.com/')
         || url.startsWith('https://abs.twimg.com/')
         || url.startsWith('https://video.twimg.com/');
+  }
+
+  function extractVideoMediaId(url) {
+    if (!url) return null;
+    const match = String(url).match(/\/(?:ext_tw_video(?:_thumb)?|amplify_video(?:_thumb)?|tweet_video(?:_thumb)?)\/(\d+)/);
+    return match ? match[1] : null;
+  }
+
+  function getVideoResolutionScore(url) {
+    const match = String(url).match(/\/(\d+)x(\d+)\//);
+    if (!match) return 0;
+    return parseInt(match[1], 10) * parseInt(match[2], 10);
+  }
+
+  function isDirectVideoVariant(url) {
+    return typeof url === 'string'
+      && url.startsWith('https://video.twimg.com/')
+      && url.includes('/vid/')
+      && /\.mp4(?:[?#]|$)/.test(url);
+  }
+
+  function rememberVideoVariant(url) {
+    if (!isDirectVideoVariant(url)) return null;
+    const mediaId = extractVideoMediaId(url);
+    if (!mediaId) return null;
+
+    let variants = videoUrlCache.get(mediaId);
+    if (!variants) {
+      variants = new Map();
+      videoUrlCache.set(mediaId, variants);
+    }
+    if (!variants.has(url)) {
+      variants.set(url, {
+        url,
+        res: getVideoResolutionScore(url)
+      });
+    }
+    return mediaId;
+  }
+
+  function getVideoCandidatesForMediaId(mediaId) {
+    const variants = mediaId ? videoUrlCache.get(mediaId) : null;
+    if (!variants) return [];
+    return [...variants.values()]
+      .sort((a, b) => a.res - b.res)
+      .map((entry) => entry.url);
   }
 
   function extractTweetId(articleEl) {
@@ -185,14 +221,31 @@
     const hasVideo = articleEl.dataset.xoeHasVideo === '1' || !!videoEl || !!videoPlayerEl;
     if (hasVideo) articleEl.dataset.xoeHasVideo = '1';
 
-    const videoUrl = hasVideo ? findVideoUrlFromNodes(articleEl, videoEl, sourceEl, videoPlayerEl) : null;
+    const videoDetails = hasVideo
+      ? findVideoDetailsFromNodes(articleEl, videoEl, sourceEl, videoPlayerEl)
+      : { videoUrl: null, videoMediaId: null, videoCandidates: [] };
 
-    const data = { id, text, textSource, author: { name, handle, avatarUrl }, timestamp, images, hasVideo, videoUrl };
+    const data = {
+      id,
+      text,
+      textSource,
+      author: { name, handle, avatarUrl },
+      timestamp,
+      images,
+      hasVideo,
+      videoUrl: videoDetails.videoUrl,
+      videoMediaId: videoDetails.videoMediaId,
+      videoCandidates: videoDetails.videoCandidates
+    };
     articleEl.__xoeCache = data;
     return data;
   }
 
   function findVideoUrlFromNodes(articleEl, videoEl, sourceEl, videoPlayerEl) {
+    return findVideoDetailsFromNodes(articleEl, videoEl, sourceEl, videoPlayerEl).videoUrl;
+  }
+
+  function findVideoDetailsFromNodes(articleEl, videoEl, sourceEl, videoPlayerEl) {
     const directCandidates = [
       videoEl?.currentSrc,
       videoEl?.src,
@@ -200,7 +253,13 @@
     ];
     for (const candidate of directCandidates) {
       if (candidate && !candidate.startsWith('blob:') && isAllowedImageUrl(candidate)) {
-        return candidate;
+        const mediaId = rememberVideoVariant(candidate) || extractVideoMediaId(candidate);
+        const candidates = mediaId ? getVideoCandidatesForMediaId(mediaId) : [candidate];
+        return {
+          videoUrl: candidate,
+          videoMediaId: mediaId,
+          videoCandidates: candidates.length > 0 ? candidates : [candidate]
+        };
       }
     }
 
@@ -218,12 +277,53 @@
     }
 
     for (const candidate of posterCandidates) {
-      const match = String(candidate).match(/\/(?:ext_tw_video_thumb|tweet_video_thumb|amplify_video_thumb)\/(\d+)\//);
-      if (!match) continue;
-      const cached = videoUrlCache.get(match[1]);
-      if (cached?.url) return cached.url;
+      const mediaId = extractVideoMediaId(candidate);
+      if (!mediaId) continue;
+      const candidates = getVideoCandidatesForMediaId(mediaId);
+      if (candidates.length > 0) {
+        return {
+          videoUrl: candidates[candidates.length - 1],
+          videoMediaId: mediaId,
+          videoCandidates: candidates
+        };
+      }
     }
-    return null;
+    return {
+      videoUrl: null,
+      videoMediaId: null,
+      videoCandidates: []
+    };
+  }
+
+  async function enrichPendingVideoTweets(tweets) {
+    const pending = tweets.filter((tweet) => tweet?.hasVideo && (!tweet.videoCandidates || tweet.videoCandidates.length === 0));
+    if (pending.length === 0) return;
+
+    const pendingIds = new Set(pending.map((tweet) => tweet.id));
+    const deadline = Date.now() + 1500;
+
+    while (Date.now() < deadline) {
+      let updatedAny = false;
+      document.querySelectorAll('article[data-testid="tweet"], article[role="article"]').forEach((articleEl) => {
+        const tweetId = extractTweetId(articleEl);
+        if (!tweetId || !pendingIds.has(tweetId)) return;
+        const refreshed = extractTweetData(articleEl);
+        if (!refreshed?.videoCandidates?.length) return;
+        const target = tweets.find((tweet) => tweet.id === tweetId);
+        if (!target) return;
+        target.videoUrl = refreshed.videoUrl;
+        target.videoMediaId = refreshed.videoMediaId;
+        target.videoCandidates = refreshed.videoCandidates;
+        updatedAny = true;
+      });
+
+      if (pending.every((tweet) => Array.isArray(tweet.videoCandidates) && tweet.videoCandidates.length > 0)) {
+        return;
+      }
+      if (!updatedAny) {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
+    }
   }
 
   function selectThreadTweets(candidates, clickedTweetId, options = {}) {
@@ -312,6 +412,8 @@
         throw new Error('Clicked tweet missing from collected thread');
       }
 
+      await enrichPendingVideoTweets(tweets);
+
       log('Saving thread:', tweetId, 'tweets:', tweets.length);
 
       const imageUrls = [];
@@ -326,16 +428,37 @@
         });
       });
 
-      const videoUrls = [...new Set(
-        tweets.map((t) => t.videoUrl).filter((u) => u && isAllowedImageUrl(u))
-      )].slice(0, MAX_VIDEOS_PER_THREAD);
+      const videoEntries = tweets
+        .map((tweet, tweetIdx) => {
+          const candidates = [];
+          const pushCandidate = (url) => {
+            if (url && isAllowedImageUrl(url) && !candidates.includes(url)) {
+              candidates.push(url);
+            }
+          };
+
+          (tweet.videoCandidates || []).forEach(pushCandidate);
+          if ((!tweet.videoCandidates || tweet.videoCandidates.length === 0) && tweet.videoMediaId) {
+            getVideoCandidatesForMediaId(tweet.videoMediaId).forEach(pushCandidate);
+          }
+          pushCandidate(tweet.videoUrl);
+
+          if (!tweet.hasVideo || candidates.length === 0) return null;
+          return {
+            tweetIdx,
+            mediaId: tweet.videoMediaId || null,
+            urls: candidates.slice(0, MAX_VIDEOS_PER_THREAD)
+          };
+        })
+        .filter(Boolean)
+        .slice(0, MAX_VIDEOS_PER_THREAD);
 
       const threadData = {
         id: tweetId,
         url: window.location.href,
         tweets,
         imageUrls,
-        videoUrls,
+        videoUrls: videoEntries,
         timestamp: Date.now(),
         tags: []
       };
@@ -351,10 +474,10 @@
           if (iconEl?.isConnected) iconEl.innerHTML = ICON_CHECK;
         }
 
-        if (videoUrls.length > 0) {
+        if (videoEntries.length > 0) {
           if (labelEl?.isConnected) labelEl.textContent = '動画取得中…';
           chrome.runtime.sendMessage(
-            { type: 'FETCH_VIDEOS', threadId: tweetId, videoUrls },
+            { type: 'FETCH_VIDEOS', threadId: tweetId, videoUrls: videoEntries },
             (vResp) => {
               if (chrome.runtime.lastError) {
                 log('Video fetch failed:', chrome.runtime.lastError.message);

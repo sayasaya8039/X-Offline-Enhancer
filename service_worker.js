@@ -454,12 +454,31 @@ async function fetchVideoWithTimeout(url, timeoutMs = VIDEO_FETCH_TIMEOUT_MS) {
   }
 }
 
+function normalizeVideoEntries(videoUrls) {
+  if (!Array.isArray(videoUrls)) return [];
+  return videoUrls
+    .map((entry, idx) => {
+      if (typeof entry === 'string') {
+        return { index: idx, urls: [entry] };
+      }
+      if (!entry || !Array.isArray(entry.urls)) return null;
+      const deduped = [...new Set(entry.urls.filter((url) => isAllowedVideoUrl(url)))];
+      if (deduped.length === 0) return null;
+      return {
+        index: Number.isFinite(Number(entry.tweetIdx)) ? Number(entry.tweetIdx) : idx,
+        urls: deduped
+      };
+    })
+    .filter(Boolean);
+}
+
 // Dedupe concurrent FETCH_VIDEOS for the same thread — prevents two sidepanel
 // calls from racing and double-storing identical blobs.
 const inFlightVideoFetches = new Map();
 
 async function fetchAndStoreVideos(threadId, videoUrls) {
-  if (!Array.isArray(videoUrls) || videoUrls.length === 0) return 0;
+  const entries = normalizeVideoEntries(videoUrls);
+  if (entries.length === 0) return 0;
 
   const existing = inFlightVideoFetches.get(threadId);
   if (existing) return existing;
@@ -471,22 +490,24 @@ async function fetchAndStoreVideos(threadId, videoUrls) {
     const worker = async () => {
       while (true) {
         const i = cursor++;
-        if (i >= videoUrls.length) return;
-        const url = videoUrls[i];
-        if (!isAllowedVideoUrl(url)) continue;
-        try {
-          const blob = await fetchVideoWithTimeout(url);
-          await addVideoBlob(threadId, i, blob, url);
-          saved++;
-          console.log('[XOE-SW] Video stored:', i, 'size:', (blob.size / 1024 / 1024).toFixed(1) + 'MB');
-        } catch (err) {
-          console.warn('[XOE-SW] Video fetch failed:', url, err.message);
+        if (i >= entries.length) return;
+        const entry = entries[i];
+        for (const url of entry.urls) {
+          try {
+            const blob = await fetchVideoWithTimeout(url);
+            await addVideoBlob(threadId, entry.index, blob, url);
+            saved++;
+            console.log('[XOE-SW] Video stored:', entry.index, 'size:', (blob.size / 1024 / 1024).toFixed(1) + 'MB');
+            break;
+          } catch (err) {
+            console.warn('[XOE-SW] Video fetch failed:', url, err.message);
+          }
         }
       }
     };
 
     const pool = [];
-    const n = Math.min(VIDEO_FETCH_CONCURRENCY, videoUrls.length);
+    const n = Math.min(VIDEO_FETCH_CONCURRENCY, entries.length);
     for (let i = 0; i < n; i++) pool.push(worker());
     await Promise.allSettled(pool);
     return saved;

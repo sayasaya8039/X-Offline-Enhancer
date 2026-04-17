@@ -58,6 +58,48 @@ function loadHandleMessageHarness() {
   return context;
 }
 
+function loadFetchAndStoreVideosHarness() {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'service_worker.js'), 'utf8');
+  const normalizeMatch = source.match(/function normalizeVideoEntries\(videoUrls\) \{[\s\S]*?\n\}/);
+  const fetchMatch = source.match(/async function fetchAndStoreVideos\(threadId, videoUrls\) \{[\s\S]*?\n\}/);
+  if (!normalizeMatch || !fetchMatch) {
+    throw new Error('video helpers not found in service_worker.js');
+  }
+
+  const stored = [];
+  const attempts = [];
+  const context = {
+    VIDEO_FETCH_CONCURRENCY: 2,
+    inFlightVideoFetches: new Map(),
+    console: {
+      log() {},
+      warn() {},
+      error() {}
+    },
+    isAllowedVideoUrl(url) {
+      return typeof url === 'string' && url.startsWith('https://video.twimg.com/');
+    },
+    async fetchVideoWithTimeout(url) {
+      attempts.push(url);
+      if (url.includes('1280x720')) {
+        throw new Error('content-length exceeds limit');
+      }
+      return { size: 1024, url };
+    },
+    async addVideoBlob(threadId, index, blob, url) {
+      stored.push({ threadId, index, blob, url });
+    }
+  };
+
+  vm.runInNewContext(
+    `${normalizeMatch[0]}\n${fetchMatch[0]}\nthis.fetchAndStoreVideos = fetchAndStoreVideos;`,
+    context
+  );
+  context.stored = stored;
+  context.attempts = attempts;
+  return context;
+}
+
 test('resolveImageSrc prefers IndexedDB blob URLs and falls back to legacy cache', () => {
   const { map, activeUrls } = buildImageBlobUrlMap(
     [
@@ -92,14 +134,14 @@ test('resolveImageSrc prefers IndexedDB blob URLs and falls back to legacy cache
   );
 });
 
-test('resolveVideoSrc falls back to the single stored video when tweet.videoUrl is missing', () => {
+test('resolveVideoSrc falls back to stored videos by tweet index when tweet.videoUrl is missing', () => {
   const tweets = [
     { id: '100', hasVideo: true, videoUrl: null },
     { id: '101', hasVideo: false, videoUrl: null }
   ];
   const { byUrl, fallbackByTweetIndex, activeUrls } = buildVideoBlobMaps(
     tweets,
-    [{ url: 'https://video.twimg.com/ext_tw_video/555/pu/vid/1280x720/clip.mp4', blob: { id: 'video-1' } }],
+    [{ index: 0, url: 'https://video.twimg.com/ext_tw_video/555/pu/vid/1280x720/clip.mp4', blob: { id: 'video-1' } }],
     (blob) => `blob:${blob.id}`
   );
 
@@ -113,6 +155,33 @@ test('resolveVideoSrc falls back to the single stored video when tweet.videoUrl 
     }),
     'blob:video-1'
   );
+});
+
+test('fetchAndStoreVideos falls back to a smaller video variant when the largest one is rejected', async () => {
+  const harness = loadFetchAndStoreVideosHarness();
+  const saved = await harness.fetchAndStoreVideos('thread-1', [
+    {
+      tweetIdx: 4,
+      urls: [
+        'https://video.twimg.com/ext_tw_video/555/pu/vid/1280x720/clip.mp4',
+        'https://video.twimg.com/ext_tw_video/555/pu/vid/640x360/clip.mp4'
+      ]
+    }
+  ]);
+
+  assert.equal(saved, 1);
+  assert.deepEqual(harness.attempts, [
+    'https://video.twimg.com/ext_tw_video/555/pu/vid/1280x720/clip.mp4',
+    'https://video.twimg.com/ext_tw_video/555/pu/vid/640x360/clip.mp4'
+  ]);
+  assert.deepEqual(harness.stored, [
+    {
+      threadId: 'thread-1',
+      index: 4,
+      blob: { size: 1024, url: 'https://video.twimg.com/ext_tw_video/555/pu/vid/640x360/clip.mp4' },
+      url: 'https://video.twimg.com/ext_tw_video/555/pu/vid/640x360/clip.mp4'
+    }
+  ]);
 });
 
 test('SAVE_THREAD waits for image persistence before responding', async () => {

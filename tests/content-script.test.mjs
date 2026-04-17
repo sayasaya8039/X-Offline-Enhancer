@@ -91,9 +91,23 @@ function loadObserverCallbackHarness() {
 
 function loadFindVideoUrlHarness() {
   const source = fs.readFileSync(path.join(__dirname, '..', 'content_script.js'), 'utf8');
-  const match = source.match(/function findVideoUrlFromNodes\([^)]*\) \{[\s\S]*?\n  \}/);
-  if (!match) {
-    throw new Error('findVideoUrlFromNodes not found in content_script.js');
+  const snippets = [
+    /function extractVideoMediaId\([^)]*\) \{[\s\S]*?\n  \}/,
+    /function getVideoResolutionScore\([^)]*\) \{[\s\S]*?\n  \}/,
+    /function isDirectVideoVariant\([^)]*\) \{[\s\S]*?\n  \}/,
+    /function rememberVideoVariant\([^)]*\) \{[\s\S]*?\n  \}/,
+    /function getVideoCandidatesForMediaId\([^)]*\) \{[\s\S]*?\n  \}/,
+    /function findVideoDetailsFromNodes\([^)]*\) \{[\s\S]*?\n  \}/,
+    /function findVideoUrlFromNodes\([^)]*\) \{[\s\S]*?\n  \}/
+  ].map((pattern) => {
+    const match = source.match(pattern);
+    if (!match) {
+      throw new Error(`Required video helper not found in content_script.js: ${pattern}`);
+    }
+    return match[0];
+  });
+  if (snippets.length === 0) {
+    throw new Error('video helpers not found in content_script.js');
   }
 
   const context = {
@@ -103,7 +117,7 @@ function loadFindVideoUrlHarness() {
     }
   };
 
-  vm.runInNewContext(`${match[0]}; this.findVideoUrlFromNodes = findVideoUrlFromNodes;`, context);
+  vm.runInNewContext(`${snippets.join('\n')}; this.findVideoUrlFromNodes = findVideoUrlFromNodes;`, context);
   return context;
 }
 
@@ -217,7 +231,9 @@ test('observer re-queues the existing article when late action-bar nodes are add
 test('findVideoUrlFromNodes resolves a cached MP4 URL from poster thumbnails when no video tag is available', () => {
   const harness = loadFindVideoUrlHarness();
   const expectedUrl = 'https://video.twimg.com/ext_tw_video/9876543210/pu/vid/1280x720/clip.mp4';
-  harness.videoUrlCache.set('9876543210', { url: expectedUrl, res: 921600 });
+  harness.videoUrlCache.set('9876543210', new Map([
+    [expectedUrl, { url: expectedUrl, res: 921600 }]
+  ]));
 
   const thumbnailImg = {
     src: 'https://pbs.twimg.com/ext_tw_video_thumb/9876543210/pu/img/thumb.jpg'
