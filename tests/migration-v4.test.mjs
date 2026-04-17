@@ -233,6 +233,28 @@ test('getAllThreadsMeta normalizes legacy summary author info and preserves time
   }
 });
 
+test('addVideoBlob persists tweet index for newly saved videos', async () => {
+  await deleteDb();
+  const calls = installChromeMock();
+  try {
+    const mod = await freshModule();
+    await mod.addVideoBlob(
+      'thread-video',
+      4,
+      new Blob(['video-bytes'], { type: 'video/mp4' }),
+      'https://video.twimg.com/ext_tw_video/555/pu/vid/640x360/clip.mp4'
+    );
+
+    const rows = await mod.getVideosByThread('thread-video');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].index, 4);
+    assert.equal(rows[0].threadId, 'thread-video');
+    assert.equal(calls.length, 0);
+  } finally {
+    removeChromeMock();
+  }
+});
+
 test('v4 migration records partial flag when cursor.update throws on a single record', async () => {
   await deleteDb();
   const calls = installChromeMock();

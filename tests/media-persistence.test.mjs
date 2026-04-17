@@ -160,6 +160,31 @@ test('resolveVideoSrc falls back to stored videos by tweet index when tweet.vide
   );
 });
 
+test('buildVideoBlobMaps recovers tweet index from legacy video record ids when index is missing', () => {
+  const tweets = [
+    { id: '100', hasVideo: true, videoUrl: 'https://video.twimg.com/ext_tw_video/555/pu/vid/1280x720/clip.mp4' }
+  ];
+  const { byUrl, fallbackByTweetIndex } = buildVideoBlobMaps(
+    tweets,
+    [{
+      id: 'thread-1:0',
+      url: 'https://video.twimg.com/ext_tw_video/555/pu/vid/640x360/clip.mp4',
+      blob: { id: 'video-legacy' }
+    }],
+    (blob) => `blob:${blob.id}`
+  );
+
+  assert.equal(
+    resolveVideoSrc({
+      tweet: tweets[0],
+      tweetIdx: 0,
+      videoBlobMap: byUrl,
+      fallbackVideoBlobMap: fallbackByTweetIndex
+    }),
+    'blob:video-legacy'
+  );
+});
+
 test('fetchAndStoreVideos falls back to a smaller video variant when the largest one is rejected', async () => {
   const harness = loadFetchAndStoreVideosHarness();
   const saved = await harness.fetchAndStoreVideos('thread-1', [
