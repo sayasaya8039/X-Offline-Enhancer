@@ -48,7 +48,8 @@
     if (!url) return false;
     try {
       const host = new URL(url).hostname.replace(/^www\./, '').toLowerCase();
-      return host === 'youtube.com'
+      return host === 't.co'
+        || host === 'youtube.com'
         || host === 'm.youtube.com'
         || host === 'youtu.be'
         || host === 'youtube-nocookie.com';
@@ -64,6 +65,12 @@
       if (isExternalVideoUrl(href)) return href;
     }
     return null;
+  }
+
+  function resolveExternalVideoUrl(articleEl, videoEl, sourceEl, videoPlayerEl) {
+    if (!videoPlayerEl) return null;
+    if (videoEl || sourceEl) return null;
+    return findExternalVideoUrl(articleEl);
   }
 
   function extractVideoMediaId(url) {
@@ -250,12 +257,8 @@
     const videoDetails = hasVideo
       ? findVideoDetailsFromNodes(articleEl, videoEl, sourceEl, videoPlayerEl)
       : { videoUrl: null, videoMediaId: null, videoCandidates: [] };
-    const hasNativeVideoCandidate = [
-      videoDetails.videoUrl,
-      ...(videoDetails.videoCandidates || [])
-    ].some((url) => isFetchableVideoCandidate(url));
-    const externalVideoUrl = hasVideo && !hasNativeVideoCandidate
-      ? findExternalVideoUrl(articleEl)
+    const externalVideoUrl = hasVideo
+      ? resolveExternalVideoUrl(articleEl, videoEl, sourceEl, videoPlayerEl)
       : null;
 
     const data = {
