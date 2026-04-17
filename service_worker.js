@@ -21,9 +21,9 @@ console.log('[XOE-SW] Service worker loaded');
 // DNR で extension origin → twitter.com Referer に書き換える。
 async function ensureVideoRefererRule() {
   try {
-    const existing = await chrome.declarativeNetRequest.getSessionRules();
-    if (existing.some((r) => r.id === 1001)) return;
+    // 既存ルールを常に削除して最新定義で置換する (旧バージョンの誤ったルールを一掃)
     await chrome.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: [1001],
       addRules: [{
         id: 1001,
         priority: 1,
@@ -42,7 +42,7 @@ async function ensureVideoRefererRule() {
         }
       }]
     });
-    console.log('[XOE-SW] video.twimg.com Referer rule registered');
+    console.log('[XOE-SW] video.twimg.com Referer rule installed');
   } catch (err) {
     console.warn('[XOE-SW] DNR rule setup failed:', err?.message || err);
   }
