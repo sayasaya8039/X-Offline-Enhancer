@@ -55,6 +55,13 @@
   }
 
   function extractTweetId(articleEl) {
+    const timeEl = articleEl.querySelector('time');
+    const timeLink = timeEl?.closest?.('a[href*="/status/"]');
+    if (timeLink?.href) {
+      const timeMatch = timeLink.href.match(/\/status\/(\d+)/);
+      if (timeMatch) return timeMatch[1];
+    }
+
     const links = articleEl.querySelectorAll('a[href*="/status/"]');
     for (const link of links) {
       const match = link.href.match(/\/status\/(\d+)/);
