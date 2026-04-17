@@ -458,6 +458,10 @@ async function fetchVideoWithTimeout(url, timeoutMs = VIDEO_FETCH_TIMEOUT_MS) {
     if (blob.size > MAX_VIDEO_BYTES) {
       throw new Error('video too large: ' + blob.size);
     }
+    // 空/極端に小さい応答は再生不可能 — 404 ページや空ボディを弾く
+    if (blob.size < 1024) {
+      throw new Error('video too small: ' + blob.size);
+    }
     return blob;
   } finally {
     clearTimeout(timer);

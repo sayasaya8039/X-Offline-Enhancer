@@ -704,11 +704,19 @@ function buildTweetArticle(tweet, tweetIdx, cache, imageBlobMap, videoBlobMap, f
       const videoEl = document.createElement('video');
       videoEl.src = videoSrc;
       videoEl.controls = true;
-      // C7: preload='none' (was 'metadata') to avoid network fetch before interaction
-      videoEl.preload = 'none';
+      // blob URL はローカルデータなので metadata プリロードは低コスト。
+      // duration / 初期フレームを表示するため metadata を使用。
+      videoEl.preload = 'metadata';
       videoEl.playsInline = true;
       videoEl.className = 'reader-tweet-video';
-      videoEl.onerror = function () { this.style.display = 'none'; };
+      videoEl.onerror = function (e) {
+        console.warn('[XOE] video load error', e, videoEl.error);
+        this.style.display = 'none';
+        const notice = document.createElement('div');
+        notice.className = 'reader-video-notice';
+        notice.textContent = '動画の読み込みに失敗しました（ファイルが破損している可能性）';
+        this.parentNode?.insertBefore(notice, this);
+      };
       tweetDiv.appendChild(videoEl);
     } else if (tweet.hasVideo) {
       const notice = document.createElement('div');
