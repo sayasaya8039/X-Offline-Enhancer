@@ -21,7 +21,7 @@
 
   try { performance.setResourceTimingBufferSize(1000); } catch {}
 
-  // ── Video URL cache (PerformanceObserver) ────────────────
+  // ── Video URL cache (PerformanceObserver + MAIN-world hook) ────────
 
   // Keeps all discovered mp4 variants per media id so save logic can fall back
   // to lower resolutions when larger variants exceed the IndexedDB size budget.
@@ -33,6 +33,19 @@
       }
     }).observe({ type: 'resource', buffered: true });
   } catch {}
+
+  // MAIN world (page_hook.js) から X API レスポンスで見つけた variant URL を受け取る。
+  // PerformanceObserver だと fMP4 init segment しか拾えない場合でも、
+  // X API が提示する progressive mp4 variant (再生可能) を確実に確保できる。
+  window.addEventListener('message', (ev) => {
+    if (ev.source !== window) return;
+    const data = ev.data;
+    if (!data || data.type !== 'XOE_VIDEO_VARIANT' || !data.url) return;
+    if (data.kind === 'mp4') {
+      rememberVideoVariant(data.url);
+    }
+    // 'hls' (m3u8) は現状使用しない (保存は mp4 ベース)
+  });
 
   // ── Helpers ──────────────────────────────────────────────
 
