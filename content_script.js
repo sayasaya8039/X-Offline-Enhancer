@@ -185,28 +185,43 @@
     const hasVideo = articleEl.dataset.xoeHasVideo === '1' || !!videoEl || !!videoPlayerEl;
     if (hasVideo) articleEl.dataset.xoeHasVideo = '1';
 
-    const videoUrl = hasVideo ? findVideoUrlFromNodes(videoEl, sourceEl) : null;
+    const videoUrl = hasVideo ? findVideoUrlFromNodes(articleEl, videoEl, sourceEl, videoPlayerEl) : null;
 
     const data = { id, text, textSource, author: { name, handle, avatarUrl }, timestamp, images, hasVideo, videoUrl };
     articleEl.__xoeCache = data;
     return data;
   }
 
-  function findVideoUrlFromNodes(videoEl, sourceEl) {
-    if (!videoEl) return null;
-
-    if (videoEl.src && !videoEl.src.startsWith('blob:') && isAllowedImageUrl(videoEl.src)) {
-      return videoEl.src;
+  function findVideoUrlFromNodes(articleEl, videoEl, sourceEl, videoPlayerEl) {
+    const directCandidates = [
+      videoEl?.currentSrc,
+      videoEl?.src,
+      sourceEl?.src
+    ];
+    for (const candidate of directCandidates) {
+      if (candidate && !candidate.startsWith('blob:') && isAllowedImageUrl(candidate)) {
+        return candidate;
+      }
     }
-    if (sourceEl?.src && !sourceEl.src.startsWith('blob:') && isAllowedImageUrl(sourceEl.src)) {
-      return sourceEl.src;
+
+    const posterCandidates = [];
+    if (videoEl?.poster) posterCandidates.push(videoEl.poster);
+    if (videoPlayerEl?.querySelectorAll) {
+      for (const img of videoPlayerEl.querySelectorAll('img')) {
+        if (img?.src) posterCandidates.push(img.src);
+      }
+    }
+    if (articleEl?.querySelectorAll) {
+      for (const img of articleEl.querySelectorAll('img')) {
+        if (img?.src) posterCandidates.push(img.src);
+      }
     }
 
-    const poster = videoEl.poster || '';
-    const posterMatch = poster.match(/\/(ext_tw_video_thumb|tweet_video_thumb|amplify_video_thumb)\/(\d+)\//);
-    if (posterMatch) {
-      const cached = videoUrlCache.get(posterMatch[2]);
-      if (cached) return cached.url;
+    for (const candidate of posterCandidates) {
+      const match = String(candidate).match(/\/(?:ext_tw_video_thumb|tweet_video_thumb|amplify_video_thumb)\/(\d+)\//);
+      if (!match) continue;
+      const cached = videoUrlCache.get(match[1]);
+      if (cached?.url) return cached.url;
     }
     return null;
   }

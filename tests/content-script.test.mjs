@@ -89,6 +89,24 @@ function loadObserverCallbackHarness() {
   return context;
 }
 
+function loadFindVideoUrlHarness() {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'content_script.js'), 'utf8');
+  const match = source.match(/function findVideoUrlFromNodes\([^)]*\) \{[\s\S]*?\n  \}/);
+  if (!match) {
+    throw new Error('findVideoUrlFromNodes not found in content_script.js');
+  }
+
+  const context = {
+    videoUrlCache: new Map(),
+    isAllowedImageUrl(url) {
+      return typeof url === 'string' && (url.startsWith('https://video.twimg.com/') || url.startsWith('https://pbs.twimg.com/'));
+    }
+  };
+
+  vm.runInNewContext(`${match[0]}; this.findVideoUrlFromNodes = findVideoUrlFromNodes;`, context);
+  return context;
+}
+
 test('extractTweetId prefers the article permalink over quoted tweet links', () => {
   const extractTweetId = loadFunctionFromContentScript('extractTweetId');
 
@@ -194,4 +212,31 @@ test('observer re-queues the existing article when late action-bar nodes are add
   harness.runObserver([{ addedNodes: [addedNode] }]);
 
   assert.equal(harness.pendingArticles.has(article), true);
+});
+
+test('findVideoUrlFromNodes resolves a cached MP4 URL from poster thumbnails when no video tag is available', () => {
+  const harness = loadFindVideoUrlHarness();
+  const expectedUrl = 'https://video.twimg.com/ext_tw_video/9876543210/pu/vid/1280x720/clip.mp4';
+  harness.videoUrlCache.set('9876543210', { url: expectedUrl, res: 921600 });
+
+  const thumbnailImg = {
+    src: 'https://pbs.twimg.com/ext_tw_video_thumb/9876543210/pu/img/thumb.jpg'
+  };
+  const articleEl = {
+    querySelectorAll(selector) {
+      assert.equal(selector, 'img');
+      return [thumbnailImg];
+    }
+  };
+  const videoPlayerEl = {
+    querySelectorAll(selector) {
+      assert.equal(selector, 'img');
+      return [thumbnailImg];
+    }
+  };
+
+  assert.equal(
+    harness.findVideoUrlFromNodes(articleEl, null, null, videoPlayerEl),
+    expectedUrl
+  );
 });

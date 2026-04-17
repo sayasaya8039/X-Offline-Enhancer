@@ -7,10 +7,17 @@ window.__xoeModuleLoaded = true;
 import { getIntegrityMessage, pickPrimaryTweet } from './lib/thread-model.mjs';
 import { isAllowedImageUrl } from './lib/utils-esm.js';
 import {
+  buildImageBlobUrlMap,
+  resolveImageSrc,
+  buildVideoBlobMaps,
+  resolveVideoSrc
+} from './lib/reader-media.mjs';
+import {
   getAllThreadsMeta, getThread, deleteThread, deleteAllThreads,
   searchThreads, getStorageSize,
   purgeExpiredCaches, purgeUntilUnderLimit,
-  getVideosByThread, deleteVideosByThread, deleteAllVideos
+  getVideosByThread, deleteVideosByThread, deleteAllVideos,
+  getImagesForThread
 } from './lib/db-esm.js';
 
 console.log('[XOE] Side panel module loaded');
@@ -25,6 +32,7 @@ let settingsOpen = false;
 let selectionMode = false;
 const selectedIds = new Set();
 const activeVideoBlobUrls = [];
+const activeImageBlobUrls = [];
 
 // Virtual scroll state
 const VIRT_INITIAL = 100;
@@ -631,7 +639,7 @@ function setupReaderObserver() {
   }, { root: readerView, rootMargin: '300px' });
 }
 
-function buildTweetArticle(tweet, cache, videoBlobMap) {
+function buildTweetArticle(tweet, tweetIdx, cache, imageBlobMap, videoBlobMap, fallbackVideoBlobMap) {
   const tweetDiv = document.createElement('article');
   tweetDiv.className = 'reader-tweet reader-tweet-pending';
   // Reserve space so the observer has stable layout to detect intersection.
@@ -650,8 +658,14 @@ function buildTweetArticle(tweet, cache, videoBlobMap) {
       const imagesDiv = document.createElement('div');
       imagesDiv.className = 'reader-tweet-images';
       imagesDiv.dataset.count = Math.min(tweet.images.length, 4);
-      tweet.images.slice(0, 4).forEach(imgUrl => {
-        const src = cache[imgUrl] || imgUrl;
+      tweet.images.slice(0, 4).forEach((imgUrl, imgIdx) => {
+        const src = resolveImageSrc({
+          tweetIdx,
+          imgIdx,
+          imgUrl,
+          imageBlobMap,
+          legacyCache: cache
+        });
         if (isAllowedImageUrl(src)) {
           const img = document.createElement('img');
           img.src = src;
@@ -664,9 +678,15 @@ function buildTweetArticle(tweet, cache, videoBlobMap) {
       if (imagesDiv.children.length > 0) tweetDiv.appendChild(imagesDiv);
     }
 
-    if (tweet.hasVideo && tweet.videoUrl && videoBlobMap.has(tweet.videoUrl)) {
+    const videoSrc = resolveVideoSrc({
+      tweet,
+      tweetIdx,
+      videoBlobMap,
+      fallbackVideoBlobMap
+    });
+    if (tweet.hasVideo && videoSrc) {
       const videoEl = document.createElement('video');
-      videoEl.src = videoBlobMap.get(tweet.videoUrl);
+      videoEl.src = videoSrc;
       videoEl.controls = true;
       // C7: preload='none' (was 'metadata') to avoid network fetch before interaction
       videoEl.preload = 'none';
@@ -674,7 +694,7 @@ function buildTweetArticle(tweet, cache, videoBlobMap) {
       videoEl.className = 'reader-tweet-video';
       videoEl.onerror = function () { this.style.display = 'none'; };
       tweetDiv.appendChild(videoEl);
-    } else if (tweet.hasVideo && !tweet.videoUrl) {
+    } else if (tweet.hasVideo) {
       const notice = document.createElement('div');
       notice.className = 'reader-video-notice';
       notice.textContent = '動画は保存されていません';
@@ -688,14 +708,17 @@ function buildTweetArticle(tweet, cache, videoBlobMap) {
 async function openReaderView(threadId) {
   let thread;
   let videos = [];
+  let images = [];
   try {
-    // H8: parallel fetch of thread + videos
-    const [t, v] = await Promise.all([
+    // H8: parallel fetch of thread + media blobs
+    const [t, v, i] = await Promise.all([
       getThread(threadId),
-      getVideosByThread(threadId).catch(() => [])
+      getVideosByThread(threadId).catch(() => []),
+      getImagesForThread(threadId).catch(() => [])
     ]);
     thread = t;
     videos = v || [];
+    images = i || [];
   } catch (err) {
     console.error('[XOE] openReaderView fetch error:', err);
     return;
@@ -710,15 +733,17 @@ async function openReaderView(threadId) {
   readerContent.textContent = '';
   activeVideoBlobUrls.forEach(u => URL.revokeObjectURL(u));
   activeVideoBlobUrls.length = 0;
+  activeImageBlobUrls.forEach(u => URL.revokeObjectURL(u));
+  activeImageBlobUrls.length = 0;
 
-  const videoBlobMap = new Map();
-  for (const v of videos) {
-    if (v && v.blob) {
-      const blobUrl = URL.createObjectURL(v.blob);
-      activeVideoBlobUrls.push(blobUrl);
-      videoBlobMap.set(v.url, blobUrl);
-    }
-  }
+  const { map: imageBlobMap, activeUrls: imageBlobUrls } = buildImageBlobUrlMap(images, (blob) => URL.createObjectURL(blob));
+  activeImageBlobUrls.push(...imageBlobUrls);
+  const {
+    byUrl: videoBlobMap,
+    fallbackByTweetIndex,
+    activeUrls: videoBlobUrls
+  } = buildVideoBlobMaps(thread.tweets || [], videos, (blob) => URL.createObjectURL(blob));
+  activeVideoBlobUrls.push(...videoBlobUrls);
 
   const firstTweet = pickPrimaryTweet(thread);
   const author = (firstTweet && firstTweet.author) || {};
@@ -757,7 +782,7 @@ async function openReaderView(threadId) {
   if (thread.tweets && thread.tweets.length > 0) {
     setupReaderObserver();
     thread.tweets.forEach((tweet, i) => {
-      const article = buildTweetArticle(tweet, cache, videoBlobMap);
+      const article = buildTweetArticle(tweet, i, cache, imageBlobMap, videoBlobMap, fallbackByTweetIndex);
       readerContent.appendChild(article);
       if (i < 3) {
         // Eagerly mount above-the-fold so first paint has content.
@@ -793,6 +818,8 @@ function closeReaderView() {
   readerContent.textContent = '';
   activeVideoBlobUrls.forEach(u => URL.revokeObjectURL(u));
   activeVideoBlobUrls.length = 0;
+  activeImageBlobUrls.forEach(u => URL.revokeObjectURL(u));
+  activeImageBlobUrls.length = 0;
   threadListView.style.display = '';
   document.getElementById('header').style.display = '';
   loadThreadList(searchInput.value.trim());
@@ -980,6 +1007,10 @@ chrome.runtime.onMessage.addListener((message) => {
     return;
   }
   if (message.type === 'VIDEOS_SAVED') {
+    updateStorageDisplay();
+    return;
+  }
+  if (message.type === 'THREAD_IMAGES_READY') {
     updateStorageDisplay();
     return;
   }

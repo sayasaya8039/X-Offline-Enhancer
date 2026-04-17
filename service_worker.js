@@ -246,35 +246,34 @@ async function handleMessage(message, sender) {
       thread.timestamp = thread.timestamp || Date.now();
 
       const pendingImageUrls = Array.isArray(thread.imageUrls) ? thread.imageUrls : [];
+      let imagesSaved = 0;
 
       await addThread(thread);
+      if (pendingImageUrls.length > 0) {
+        imagesSaved = await fetchAndStoreImages(thread.id, pendingImageUrls);
+        if (imagesSaved > 0) {
+          broadcastToExtension({ type: 'THREAD_IMAGES_READY', threadId: thread.id, saved: imagesSaved });
+        }
+      }
       console.log('[XOE-SW] Thread saved:', thread.id, 'tweets:', thread.tweets.length,
-                  'imageUrls:', pendingImageUrls.length);
+                  'imageUrls:', pendingImageUrls.length, 'imagesSaved:', imagesSaved);
 
       if (sender.tab?.id) {
         chrome.tabs.sendMessage(sender.tab.id, {
           type: 'SAVE_COMPLETE', id: thread.id
         }).catch(() => {});
       }
-      broadcastToExtension({ type: 'THREAD_SAVED', threadId: thread.id });
-
-      // Fire-and-forget image fetch. The SW stays alive while these awaited
-      // Promises are pending, even after sendResponse returns. Any throw is
-      // swallowed so an image network failure cannot kill the worker.
-      if (pendingImageUrls.length > 0) {
-        fetchAndStoreImages(thread.id, pendingImageUrls)
-          .then((n) => {
-            if (n > 0) {
-              broadcastToExtension({ type: 'THREAD_IMAGES_READY', threadId: thread.id, saved: n });
-            }
-          })
-          .catch((err) => console.warn('[XOE-SW] Image batch failed:', err.message));
-      }
+      broadcastToExtension({ type: 'THREAD_SAVED', threadId: thread.id, imagesSaved });
 
       // Debounced cleanup: collapse rapid saves into one run per minute.
       scheduleCleanup();
 
-      return { success: true, id: thread.id, imageFetch: pendingImageUrls.length > 0 ? 'pending' : 'none' };
+      return {
+        success: true,
+        id: thread.id,
+        imagesSaved,
+        imageFetch: pendingImageUrls.length > 0 ? 'done' : 'none'
+      };
     }
 
     case 'DELETE_THREAD': {
