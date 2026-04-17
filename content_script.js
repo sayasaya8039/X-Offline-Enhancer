@@ -23,29 +23,49 @@
 
   // ── Video URL cache (PerformanceObserver + MAIN-world hook) ────────
 
-  // Keeps all discovered mp4 variants per media id so save logic can fall back
-  // to lower resolutions when larger variants exceed the IndexedDB size budget.
   const videoUrlCache = new Map(); // mediaId -> Map<url, { url, res }>
+  const hlsUrlCache = new Map();   // mediaId -> Set<m3u8 url>
+
   try {
     new PerformanceObserver((list) => {
       for (const entry of list.getEntries()) {
         rememberVideoVariant(entry.name);
+        rememberHlsPlaylist(entry.name);
       }
     }).observe({ type: 'resource', buffered: true });
   } catch {}
 
-  // MAIN world (page_hook.js) から X API レスポンスで見つけた variant URL を受け取る。
-  // PerformanceObserver だと fMP4 init segment しか拾えない場合でも、
-  // X API が提示する progressive mp4 variant (再生可能) を確実に確保できる。
   window.addEventListener('message', (ev) => {
     if (ev.source !== window) return;
     const data = ev.data;
     if (!data || data.type !== 'XOE_VIDEO_VARIANT' || !data.url) return;
-    if (data.kind === 'mp4') {
-      rememberVideoVariant(data.url);
-    }
-    // 'hls' (m3u8) は現状使用しない (保存は mp4 ベース)
+    if (data.kind === 'mp4') rememberVideoVariant(data.url);
+    else if (data.kind === 'hls') rememberHlsPlaylist(data.url);
   });
+
+  function isHlsPlaylistUrl(url) {
+    return typeof url === 'string'
+      && url.startsWith('https://video.twimg.com/')
+      && /\.m3u8(?:[?#]|$)/.test(url);
+  }
+
+  function rememberHlsPlaylist(url) {
+    if (!isHlsPlaylistUrl(url)) return null;
+    const mediaId = extractVideoMediaId(url);
+    if (!mediaId) return null;
+    let set = hlsUrlCache.get(mediaId);
+    if (!set) {
+      set = new Set();
+      hlsUrlCache.set(mediaId, set);
+    }
+    set.add(url);
+    return mediaId;
+  }
+
+  function getHlsCandidatesForMediaId(mediaId) {
+    const set = mediaId ? hlsUrlCache.get(mediaId) : null;
+    return set ? [...set] : [];
+  }
 
   // ── Helpers ──────────────────────────────────────────────
 
@@ -129,7 +149,7 @@
   }
 
   function isFetchableVideoCandidate(url) {
-    return isDirectVideoVariant(url);
+    return isDirectVideoVariant(url) || isHlsPlaylistUrl(url);
   }
 
   function rememberVideoVariant(url) {
@@ -452,6 +472,10 @@
           getVideoCandidatesForMediaId(tweet.videoMediaId).forEach(pushCandidate);
         }
         pushCandidate(tweet.videoUrl);
+        // mp4 が全滅した時の最終フォールバックとして HLS m3u8 URL を末尾に追加
+        if (tweet.videoMediaId) {
+          getHlsCandidatesForMediaId(tweet.videoMediaId).forEach(pushCandidate);
+        }
 
         if (!tweet.hasVideo || candidates.length === 0) return null;
         return {
@@ -929,29 +953,138 @@
   // スタブ応答 (904 bytes 等) を返す。ページ内 fetch はブラウザが自動で
   // Referer=https://x.com/, Origin=https://x.com, Cookie を付与するため
   // 正規 player と同じリクエストとして扱われる。
+  async function fetchArrayBuffer(url) {
+    const resp = await fetch(url, { credentials: 'omit', mode: 'cors' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + url);
+    return resp.arrayBuffer();
+  }
+
+  async function fetchText(url) {
+    const resp = await fetch(url, { credentials: 'omit', mode: 'cors' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + url);
+    return resp.text();
+  }
+
+  function parseM3u8Variants(text, baseUrl) {
+    const lines = text.split(/\r?\n/);
+    const variants = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.startsWith('#EXT-X-STREAM-INF')) {
+        const bw = line.match(/BANDWIDTH=(\d+)/);
+        const res = line.match(/RESOLUTION=(\d+)x(\d+)/);
+        const next = (lines[i + 1] || '').trim();
+        if (next && !next.startsWith('#')) {
+          try {
+            variants.push({
+              url: new URL(next, baseUrl).href,
+              bandwidth: bw ? Number(bw[1]) : 0,
+              resolution: res ? { w: Number(res[1]), h: Number(res[2]) } : null
+            });
+          } catch {}
+        }
+      }
+    }
+    return variants;
+  }
+
+  function parseM3u8Segments(text, baseUrl) {
+    const lines = text.split(/\r?\n/);
+    let initUrl = null;
+    const segmentUrls = [];
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      if (line.startsWith('#EXT-X-MAP:')) {
+        const m = line.match(/URI="([^"]+)"/);
+        if (m) {
+          try { initUrl = new URL(m[1], baseUrl).href; } catch {}
+        }
+      } else if (!line.startsWith('#')) {
+        try { segmentUrls.push(new URL(line, baseUrl).href); } catch {}
+      }
+    }
+    return { initUrl, segmentUrls };
+  }
+
+  // HLS プレイリスト URL を受け取り、全セグメントを結合した mp4 ArrayBuffer を返す。
+  // 再生可能な fMP4 (init + 全 media segment の連結バイト列) を生成。
+  async function fetchHlsAsArrayBuffer(m3u8Url) {
+    console.log('[XOE-CS] HLS master:', m3u8Url);
+    const masterText = await fetchText(m3u8Url);
+    const variants = parseM3u8Variants(masterText, m3u8Url);
+
+    // variant playlist 決定: master なら variant 選択、そうでなければ既に variant
+    let variantUrl = m3u8Url;
+    let variantText = masterText;
+    if (variants.length > 0) {
+      // 中画質 (height 480-720 帯) を優先、なければ最も帯域小さいもの
+      variants.sort((a, b) => a.bandwidth - b.bandwidth);
+      let chosen = variants[0];
+      for (const v of variants) {
+        if (v.resolution && v.resolution.h >= 480 && v.resolution.h <= 720) { chosen = v; break; }
+      }
+      console.log('[XOE-CS] HLS variant chosen:', chosen.resolution, chosen.bandwidth, chosen.url);
+      variantUrl = chosen.url;
+      variantText = await fetchText(variantUrl);
+    }
+
+    const { initUrl, segmentUrls } = parseM3u8Segments(variantText, variantUrl);
+    console.log('[XOE-CS] HLS segments:', segmentUrls.length, 'init:', !!initUrl);
+    if (segmentUrls.length === 0) throw new Error('no HLS segments found');
+
+    // init → 全セグメント を逐次 DL (並行すると X CDN が 429 を返すことがある)
+    const parts = [];
+    if (initUrl) parts.push(new Uint8Array(await fetchArrayBuffer(initUrl)));
+    let total = parts.reduce((s, p) => s + p.byteLength, 0);
+    const MAX = 50 * 1024 * 1024;
+    for (let i = 0; i < segmentUrls.length; i++) {
+      const seg = new Uint8Array(await fetchArrayBuffer(segmentUrls[i]));
+      parts.push(seg);
+      total += seg.byteLength;
+      if (total > MAX) throw new Error('HLS total exceeds 50MB at segment ' + i);
+    }
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const p of parts) { merged.set(p, offset); offset += p.byteLength; }
+    console.log('[XOE-CS] HLS merged:', (total / 1024 / 1024).toFixed(1) + 'MB');
+    return merged.buffer;
+  }
+
+  function arrayBufferToBase64(buf) {
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  }
+
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg?.type !== 'FETCH_VIDEO_VIA_PAGE') return;
     (async () => {
       try {
-        // credentials: 'omit' — X CDN は Access-Control-Allow-Origin: * を返すため、
-        // credentials: 'include' では CORS エラー ("Failed to fetch") になる。
-        // ページ内 fetch は自動で Referer/Origin を付けてくれるのでこれで十分。
-        const resp = await fetch(msg.url, { credentials: 'omit', mode: 'cors' });
-        console.log('[XOE-CS] fetch', msg.url, 'status=', resp.status, 'ct=', resp.headers.get('content-type'));
-        if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        const ct = resp.headers.get('content-type') || '';
-        if (!/^video\//i.test(ct)) throw new Error('unexpected content-type: ' + ct);
-        const buf = await resp.arrayBuffer();
-        console.log('[XOE-CS] body bytes=', buf.byteLength);
-        if (buf.byteLength < 10240) throw new Error('response too small: ' + buf.byteLength);
-        const bytes = new Uint8Array(buf);
-        let binary = '';
-        const chunkSize = 0x8000;
-        for (let i = 0; i < bytes.length; i += chunkSize) {
-          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+        const isM3u8 = /\.m3u8(?:[?#]|$)/i.test(msg.url);
+        let buf, contentType;
+
+        if (isM3u8) {
+          // HLS パス: master m3u8 から variant + segments を辿り結合
+          buf = await fetchHlsAsArrayBuffer(msg.url);
+          contentType = 'video/mp4';
+        } else {
+          const resp = await fetch(msg.url, { credentials: 'omit', mode: 'cors' });
+          console.log('[XOE-CS] fetch', msg.url, 'status=', resp.status, 'ct=', resp.headers.get('content-type'));
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          contentType = resp.headers.get('content-type') || '';
+          if (!/^video\//i.test(contentType)) throw new Error('unexpected content-type: ' + contentType);
+          buf = await resp.arrayBuffer();
+          console.log('[XOE-CS] body bytes=', buf.byteLength);
+          if (buf.byteLength < 10240) throw new Error('response too small: ' + buf.byteLength);
         }
-        const base64 = btoa(binary);
-        sendResponse({ ok: true, base64, contentType: ct, size: buf.byteLength });
+
+        const base64 = arrayBufferToBase64(buf);
+        sendResponse({ ok: true, base64, contentType, size: buf.byteLength });
       } catch (err) {
         console.warn('[XOE-CS] fetch failed', msg.url, err?.message || err);
         sendResponse({ ok: false, error: err?.message || String(err) });

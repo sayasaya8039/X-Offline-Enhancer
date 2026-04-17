@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "X Offline Enhancer",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Save X/Twitter threads for offline reading with PiP video support",
   "permissions": [
     "sidePanel",

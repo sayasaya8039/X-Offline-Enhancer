@@ -464,6 +464,8 @@ function isAllowedVideoUrl(url) {
   try {
     const parsed = new URL(url);
     if (!ALLOWED_VIDEO_HOSTS.includes(parsed.hostname)) return false;
+    // HLS m3u8 も許可 (HLS フォールバック用)
+    if (/\.m3u8$/i.test(parsed.pathname)) return true;
     if (!/\.mp4$/i.test(parsed.pathname)) return false;
     // ext_tw_video / amplify_video は /vid/、tweet_video (GIF) は /tweet_video/
     return parsed.pathname.includes('/vid/') || parsed.pathname.includes('/tweet_video/');
@@ -560,13 +562,16 @@ async function fetchAndStoreVideos(threadId, videoUrls, tabId = null) {
         const entry = entries[i];
         for (const url of entry.urls) {
           let blob = null;
-          // 1st: SW fetch (DNR で Referer 注入済み)
-          try {
-            blob = await fetchVideoWithTimeout(url);
-          } catch (err) {
-            console.warn('[XOE-SW] SW fetch failed:', url, err.message);
+          const isM3u8 = /\.m3u8(?:[?#]|$)/i.test(url);
+          // 1st: SW fetch (mp4 のみ、m3u8 は HLS 処理が必要なので CS に委任)
+          if (!isM3u8) {
+            try {
+              blob = await fetchVideoWithTimeout(url);
+            } catch (err) {
+              console.warn('[XOE-SW] SW fetch failed:', url, err.message);
+            }
           }
-          // 2nd: Content Script 経由 fetch (ページ context = 正規の Referer/Cookie)
+          // 2nd: Content Script 経由 (mp4 は page-context fetch、m3u8 は HLS パース+結合)
           if (!blob && tabId != null) {
             try {
               blob = await fetchVideoViaContentScript(url, tabId);
