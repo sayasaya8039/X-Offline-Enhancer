@@ -18,6 +18,7 @@
 
   const MAX_IMAGES = 50;
   const MAX_VIDEOS_PER_THREAD = 10;
+  const MAX_VIDEO_BYTES = 50 * 1024 * 1024;
 
   try { performance.setResourceTimingBufferSize(1000); } catch {}
 
@@ -68,6 +69,24 @@
   }
 
   // ── Helpers ──────────────────────────────────────────────
+
+  function redactUrlForLog(url) {
+    const raw = String(url || '');
+    if (!raw) return '';
+    try {
+      const baseUrl = typeof location !== 'undefined' ? location.href : undefined;
+      const parsed = baseUrl ? new URL(raw, baseUrl) : new URL(raw);
+      return parsed.origin === 'null' ? parsed.pathname : parsed.origin + parsed.pathname;
+    } catch {
+      return raw.split('#')[0].split('?')[0];
+    }
+  }
+
+  function enforceMaxVideoBytes(byteLength, label) {
+    if (byteLength > MAX_VIDEO_BYTES) {
+      throw new Error((label || 'video') + ' exceeds 50MB: ' + byteLength);
+    }
+  }
 
   function isAllowedImageUrl(url) {
     if (!url) return false;
@@ -968,13 +987,13 @@
   // 正規 player と同じリクエストとして扱われる。
   async function fetchArrayBuffer(url) {
     const resp = await fetch(url, { credentials: 'omit', mode: 'cors' });
-    if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + url);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + redactUrlForLog(url));
     return resp.arrayBuffer();
   }
 
   async function fetchText(url) {
     const resp = await fetch(url, { credentials: 'omit', mode: 'cors' });
-    if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + url);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + redactUrlForLog(url));
     return resp.text();
   }
 
@@ -1023,7 +1042,7 @@
   // HLS プレイリスト URL を受け取り、全セグメントを結合した mp4 ArrayBuffer を返す。
   // 再生可能な fMP4 (init + 全 media segment の連結バイト列) を生成。
   async function fetchHlsAsArrayBuffer(m3u8Url) {
-    console.log('[XOE-CS] HLS master:', m3u8Url);
+    console.log('[XOE-CS] HLS master:', redactUrlForLog(m3u8Url));
     const masterText = await fetchText(m3u8Url);
     const variants = parseM3u8Variants(masterText, m3u8Url);
 
@@ -1037,7 +1056,7 @@
       for (const v of variants) {
         if (v.resolution && v.resolution.h >= 480 && v.resolution.h <= 720) { chosen = v; break; }
       }
-      console.log('[XOE-CS] HLS variant chosen:', chosen.resolution, chosen.bandwidth, chosen.url);
+      console.log('[XOE-CS] HLS variant chosen:', chosen.resolution, chosen.bandwidth, redactUrlForLog(chosen.url));
       variantUrl = chosen.url;
       variantText = await fetchText(variantUrl);
     }
@@ -1050,12 +1069,11 @@
     const parts = [];
     if (initUrl) parts.push(new Uint8Array(await fetchArrayBuffer(initUrl)));
     let total = parts.reduce((s, p) => s + p.byteLength, 0);
-    const MAX = 50 * 1024 * 1024;
     for (let i = 0; i < segmentUrls.length; i++) {
       const seg = new Uint8Array(await fetchArrayBuffer(segmentUrls[i]));
       parts.push(seg);
       total += seg.byteLength;
-      if (total > MAX) throw new Error('HLS total exceeds 50MB at segment ' + i);
+      if (total > MAX_VIDEO_BYTES) throw new Error('HLS total exceeds 50MB at segment ' + i);
     }
     const merged = new Uint8Array(total);
     let offset = 0;
@@ -1087,19 +1105,24 @@
           contentType = 'video/mp4';
         } else {
           const resp = await fetch(msg.url, { credentials: 'omit', mode: 'cors' });
-          console.log('[XOE-CS] fetch', msg.url, 'status=', resp.status, 'ct=', resp.headers.get('content-type'));
+          console.log('[XOE-CS] fetch', redactUrlForLog(msg.url), 'status=', resp.status, 'ct=', resp.headers.get('content-type'));
           if (!resp.ok) throw new Error('HTTP ' + resp.status);
           contentType = resp.headers.get('content-type') || '';
           if (!/^video\//i.test(contentType)) throw new Error('unexpected content-type: ' + contentType);
+          const contentLength = Number(resp.headers.get('content-length') || 0);
+          if (Number.isFinite(contentLength) && contentLength > 0) {
+            enforceMaxVideoBytes(contentLength, 'MP4');
+          }
           buf = await resp.arrayBuffer();
           console.log('[XOE-CS] body bytes=', buf.byteLength);
+          enforceMaxVideoBytes(buf.byteLength, 'MP4');
           if (buf.byteLength < 10240) throw new Error('response too small: ' + buf.byteLength);
         }
 
         const base64 = arrayBufferToBase64(buf);
         sendResponse({ ok: true, base64, contentType, size: buf.byteLength });
       } catch (err) {
-        console.warn('[XOE-CS] fetch failed', msg.url, err?.message || err);
+        console.warn('[XOE-CS] fetch failed', redactUrlForLog(msg.url), err?.message || err);
         sendResponse({ ok: false, error: err?.message || String(err) });
       }
     })();

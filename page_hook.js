@@ -11,12 +11,28 @@
   'use strict';
 
   const PREFIX = '[XOE-HOOK]';
+  const MAX_SEEN_URLS = 1000;
+  const MAX_RESPONSE_TEXT_CHARS = 5 * 1024 * 1024;
   const seenUrls = new Set();
+
+  function rememberSeenUrl(url) {
+    if (seenUrls.has(url)) {
+      seenUrls.delete(url);
+      seenUrls.add(url);
+      return false;
+    }
+
+    seenUrls.add(url);
+    if (seenUrls.size > MAX_SEEN_URLS) {
+      const oldest = seenUrls.values().next().value;
+      seenUrls.delete(oldest);
+    }
+    return true;
+  }
 
   function postVariant(url, kind, extra) {
     if (!url || typeof url !== 'string') return;
-    if (seenUrls.has(url)) return;
-    seenUrls.add(url);
+    if (!rememberSeenUrl(url)) return;
     window.postMessage({
       type: 'XOE_VIDEO_VARIANT',
       url,
@@ -49,8 +65,44 @@
     }
   }
 
+  function isApiCandidate(url) {
+    const str = String(url || '');
+    return str.includes('/graphql/')
+      || str.includes('/i/api/')
+      || str.includes('TweetResult')
+      || str.includes('TweetDetail');
+  }
+
+  function getHeader(headers, name) {
+    try {
+      if (headers && typeof headers.get === 'function') return headers.get(name) || '';
+      if (headers && typeof headers.getResponseHeader === 'function') return headers.getResponseHeader(name) || '';
+    } catch {}
+    return '';
+  }
+
+  function shouldInspectHeaders(headers) {
+    const contentLength = Number(getHeader(headers, 'content-length') || 0);
+    if (Number.isFinite(contentLength) && contentLength > MAX_RESPONSE_TEXT_CHARS) return false;
+
+    const contentType = getHeader(headers, 'content-type');
+    if (!contentType) return true;
+    return /(?:json|graphql|javascript|text)/i.test(contentType);
+  }
+
+  function hasVariantSignal(bodyText) {
+    return bodyText.includes('video_info')
+      || bodyText.includes('variants')
+      || bodyText.includes('video/mp4')
+      || bodyText.includes('mpegURL')
+      || bodyText.includes('.m3u8');
+  }
+
   function tryExtract(bodyText, url) {
     if (!bodyText || bodyText.length < 2) return;
+    if (!isApiCandidate(url)) return;
+    if (bodyText.length > MAX_RESPONSE_TEXT_CHARS) return;
+    if (!hasVariantSignal(bodyText)) return;
     try {
       const data = JSON.parse(bodyText);
       scanObject(data);
@@ -65,7 +117,7 @@
     const resp = await origFetch.apply(this, arguments);
     try {
       const reqUrl = typeof input === 'string' ? input : (input?.url || '');
-      if (reqUrl && (reqUrl.includes('/graphql/') || reqUrl.includes('/i/api/') || reqUrl.includes('TweetResult') || reqUrl.includes('TweetDetail'))) {
+      if (isApiCandidate(reqUrl) && shouldInspectHeaders(resp.headers)) {
         resp.clone().text().then((txt) => tryExtract(txt, reqUrl)).catch(() => {});
       }
     } catch {}
@@ -81,9 +133,10 @@
   };
   XMLHttpRequest.prototype.send = function () {
     const url = this.__xoeUrl || '';
-    if (url && (url.includes('/graphql/') || url.includes('/i/api/') || url.includes('TweetResult') || url.includes('TweetDetail'))) {
+    if (isApiCandidate(url)) {
       this.addEventListener('load', () => {
         try {
+          if (!shouldInspectHeaders(this)) return;
           const body = this.responseType === '' || this.responseType === 'text' ? this.responseText : null;
           if (body) tryExtract(body, url);
         } catch {}

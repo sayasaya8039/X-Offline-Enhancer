@@ -21,6 +21,38 @@ function loadFunctionFromContentScript(functionName) {
   return context[functionName];
 }
 
+function loadContentScriptSnippets(patterns, exportCode, context = {}) {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'content_script.js'), 'utf8');
+  const snippets = patterns.map((pattern) => {
+    const match = source.match(pattern);
+    if (!match) {
+      throw new Error(`Required content_script.js snippet not found: ${pattern}`);
+    }
+    return match[0];
+  });
+
+  vm.runInNewContext(`${snippets.join('\n')}; ${exportCode}`, context);
+  return context;
+}
+
+function loadRedactUrlForLogHarness() {
+  return loadContentScriptSnippets(
+    [/function redactUrlForLog\([^)]*\) \{[\s\S]*?\n  \}/],
+    'this.redactUrlForLog = redactUrlForLog;',
+    { URL }
+  );
+}
+
+function loadVideoSizeLimitHarness() {
+  return loadContentScriptSnippets(
+    [
+      /const MAX_VIDEO_BYTES = \d+ \* 1024 \* 1024;/,
+      /function enforceMaxVideoBytes\([^)]*\) \{[\s\S]*?\n  \}/
+    ],
+    'this.MAX_VIDEO_BYTES = MAX_VIDEO_BYTES; this.enforceMaxVideoBytes = enforceMaxVideoBytes;'
+  );
+}
+
 function loadInjectButtonsHarness() {
   const source = fs.readFileSync(path.join(__dirname, '..', 'content_script.js'), 'utf8');
   const match = source.match(/function injectButtons\(article\) \{[\s\S]*?\n  \}/);
@@ -260,6 +292,29 @@ test('extractTweetId falls back to the first status link when no permalink time 
   };
 
   assert.equal(extractTweetId(articleEl), '3333333333333333333');
+});
+
+test('redactUrlForLog removes query strings and fragments from video URLs', () => {
+  const { redactUrlForLog } = loadRedactUrlForLogHarness();
+
+  assert.equal(
+    redactUrlForLog('https://video.twimg.com/ext_tw_video/123/pu/vid/720x720/clip.mp4?tag=12&token=secret#frag'),
+    'https://video.twimg.com/ext_tw_video/123/pu/vid/720x720/clip.mp4'
+  );
+  assert.equal(
+    redactUrlForLog('/i/api/graphql/TweetDetail?variables=secret#frag'),
+    '/i/api/graphql/TweetDetail'
+  );
+});
+
+test('enforceMaxVideoBytes rejects MP4 fallback bodies over 50MB before base64 conversion', () => {
+  const { MAX_VIDEO_BYTES, enforceMaxVideoBytes } = loadVideoSizeLimitHarness();
+
+  assert.doesNotThrow(() => enforceMaxVideoBytes(MAX_VIDEO_BYTES, 'MP4'));
+  assert.throws(
+    () => enforceMaxVideoBytes(MAX_VIDEO_BYTES + 1, 'MP4'),
+    /MP4 exceeds 50MB/
+  );
 });
 
 test('collectThreadTweets includes role-only thread replies when tweet testid articles are also present', () => {
