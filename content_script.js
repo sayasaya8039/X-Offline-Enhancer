@@ -531,14 +531,14 @@
       return only ? [only] : [];
     }
 
-    let articles = scopeRoot.querySelectorAll('article[data-testid="tweet"]');
-    if (articles.length === 0) {
-      articles = scopeRoot.querySelectorAll('article[role="article"]');
-    }
+    const articles = scopeRoot.querySelectorAll('article[data-testid="tweet"], article[role="article"]');
 
     const candidates = [];
     const seen = new Set();
     for (const article of articles) {
+      const parentArticle = article.parentElement?.closest?.('article[data-testid="tweet"], article[role="article"]');
+      if (parentArticle) continue;
+
       const data = extractTweetData(article);
       if (data && !seen.has(data.id)) {
         seen.add(data.id);

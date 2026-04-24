@@ -151,6 +151,37 @@ function loadBuildVideoEntriesHarness() {
   return context;
 }
 
+function loadCollectThreadTweetsHarness() {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'content_script.js'), 'utf8');
+  const match = source.match(/function collectThreadTweets\(rootArticle\) \{[\s\S]*?\n  \}/);
+  if (!match) {
+    throw new Error('collectThreadTweets not found in content_script.js');
+  }
+
+  const context = {
+    document: {
+      querySelector() {
+        return null;
+      }
+    },
+    extractTweetId(article) {
+      return article?.tweetId || '';
+    },
+    extractTweetData(article) {
+      return article?.tweet || null;
+    },
+    selectThreadTweets(candidates) {
+      return candidates;
+    },
+    isThreadDetailPage() {
+      return true;
+    }
+  };
+
+  vm.runInNewContext(`${match[0]}; this.collectThreadTweets = collectThreadTweets;`, context);
+  return context.collectThreadTweets;
+}
+
 test('extractTweetId prefers the article permalink over quoted tweet links', () => {
   const extractTweetId = loadFunctionFromContentScript('extractTweetId');
 
@@ -195,6 +226,76 @@ test('extractTweetId falls back to the first status link when no permalink time 
   };
 
   assert.equal(extractTweetId(articleEl), '3333333333333333333');
+});
+
+test('collectThreadTweets includes role-only thread replies when tweet testid articles are also present', () => {
+  const collectThreadTweets = loadCollectThreadTweetsHarness();
+  let scopeRoot;
+  const clickedArticle = {
+    tweetId: '100',
+    tweet: { id: '100', text: 'first', images: [], hasVideo: false, author: { handle: 'alice' } },
+    closest(selector) {
+      assert.equal(selector, '[data-testid="primaryColumn"]');
+      return scopeRoot;
+    }
+  };
+  const replyArticle = {
+    tweetId: '101',
+    tweet: { id: '101', text: 'second', images: [], hasVideo: false, author: { handle: 'alice' } }
+  };
+  scopeRoot = {
+    querySelectorAll(selector) {
+      if (selector === 'article[data-testid="tweet"]') return [clickedArticle];
+      if (selector === 'article[role="article"]') return [clickedArticle, replyArticle];
+      if (selector === 'article[data-testid="tweet"], article[role="article"]') {
+        return [clickedArticle, replyArticle];
+      }
+      throw new Error(`unexpected selector: ${selector}`);
+    }
+  };
+
+  const tweets = collectThreadTweets(clickedArticle);
+
+  assert.deepEqual(Array.from(tweets, (tweet) => tweet.id), ['100', '101']);
+});
+
+test('collectThreadTweets ignores nested role-only articles inside tweet cards', () => {
+  const collectThreadTweets = loadCollectThreadTweetsHarness();
+  let scopeRoot;
+  const clickedArticle = {
+    tweetId: '100',
+    tweet: { id: '100', text: 'first', images: [], hasVideo: false, author: { handle: 'alice' } },
+    closest(selector) {
+      assert.equal(selector, '[data-testid="primaryColumn"]');
+      return scopeRoot;
+    }
+  };
+  const nestedQuoteArticle = {
+    tweetId: '999',
+    tweet: { id: '999', text: 'quoted', images: [], hasVideo: false, author: { handle: 'bob' } },
+    parentElement: {
+      closest(selector) {
+        assert.equal(selector, 'article[data-testid="tweet"], article[role="article"]');
+        return clickedArticle;
+      }
+    }
+  };
+  const replyArticle = {
+    tweetId: '101',
+    tweet: { id: '101', text: 'second', images: [], hasVideo: false, author: { handle: 'alice' } }
+  };
+  scopeRoot = {
+    querySelectorAll(selector) {
+      if (selector === 'article[data-testid="tweet"], article[role="article"]') {
+        return [clickedArticle, nestedQuoteArticle, replyArticle];
+      }
+      return [];
+    }
+  };
+
+  const tweets = collectThreadTweets(clickedArticle);
+
+  assert.deepEqual(Array.from(tweets, (tweet) => tweet.id), ['100', '101']);
 });
 
 test('injectButtons leaves articles retryable until the action bar exists', () => {
