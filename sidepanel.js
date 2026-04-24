@@ -7,10 +7,10 @@ window.__xoeModuleLoaded = true;
 import { getIntegrityMessage, pickPrimaryTweet } from './lib/thread-model.mjs';
 import { isAllowedImageUrl } from './lib/utils-esm.js';
 import {
-  buildImageBlobUrlMap,
+  buildLazyImageBlobUrlMap,
   resolveImageSrc,
   resolveAvatarSrc,
-  buildVideoBlobMaps,
+  buildLazyVideoBlobMaps,
   resolveVideoSrc
 } from './lib/reader-media.mjs';
 import {
@@ -762,14 +762,20 @@ async function openReaderView(threadId) {
   activeImageBlobUrls.forEach(u => URL.revokeObjectURL(u));
   activeImageBlobUrls.length = 0;
 
-  const { map: imageBlobMap, activeUrls: imageBlobUrls } = buildImageBlobUrlMap(images, (blob) => URL.createObjectURL(blob));
-  activeImageBlobUrls.push(...imageBlobUrls);
+  const { map: imageBlobMap } = buildLazyImageBlobUrlMap(
+    images,
+    (blob) => URL.createObjectURL(blob),
+    activeImageBlobUrls
+  );
   const {
     byUrl: videoBlobMap,
-    fallbackByTweetIndex,
-    activeUrls: videoBlobUrls
-  } = buildVideoBlobMaps(thread.tweets || [], videos, (blob) => URL.createObjectURL(blob));
-  activeVideoBlobUrls.push(...videoBlobUrls);
+    fallbackByTweetIndex
+  } = buildLazyVideoBlobMaps(
+    thread.tweets || [],
+    videos,
+    (blob) => URL.createObjectURL(blob),
+    activeVideoBlobUrls
+  );
 
   const firstTweet = pickPrimaryTweet(thread);
   const author = (firstTweet && firstTweet.author) || {};
@@ -1037,6 +1043,20 @@ function scheduleThreadSavedRefresh() {
   }, 200);
 }
 
+function isCurrentReaderThread(threadId) {
+  return currentView === 'reader'
+    && currentThreadId != null
+    && threadId != null
+    && String(currentThreadId) === String(threadId);
+}
+
+function refreshCurrentReaderImages(threadId) {
+  if (!isCurrentReaderThread(threadId)) return;
+  openReaderView(threadId).catch((err) => {
+    console.error('[XOE] failed to refresh reader images:', err);
+  });
+}
+
 async function handlePdfReady(message) {
   pdfExporting = false;
   btnExportPdf.disabled = false;
@@ -1122,6 +1142,15 @@ chrome.runtime.onMessage.addListener((message) => {
     return;
   }
   if (message.type === 'THREAD_IMAGES_READY') {
+    updateStorageDisplay();
+    refreshCurrentReaderImages(message.threadId);
+    return;
+  }
+  if (message.type === 'THREAD_IMAGES_FAILED') {
+    console.warn('[XOE] thread image persistence failed:', {
+      threadId: message.threadId,
+      error: message.error || message.reason || null
+    });
     updateStorageDisplay();
     return;
   }

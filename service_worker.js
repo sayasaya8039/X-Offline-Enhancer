@@ -7,7 +7,7 @@ import {
   addThread, getThread, deleteThread, deleteAllThreads,
   searchThreads, getSavedIds, getStorageSize,
   purgeExpiredCaches, purgeUntilUnderLimit, purgeBlobsOverflow,
-  addImages,
+  addImages, deleteImagesForThread,
   addVideoBlob, deleteVideosByThread, deleteAllVideos
 } from './lib/db-esm.js';
 import { validateThreadForStorage } from './lib/thread-model.mjs';
@@ -141,6 +141,227 @@ async function runDebouncedCleanup() {
   }
 }
 
+// ─── Image Persistence Queue ───────────────────────────────
+
+const IMAGE_JOB_QUEUE_KEY = 'xoePendingImageJobs';
+const IMAGE_JOB_ALARM_NAME = 'image-persistence-jobs';
+const IMAGE_JOB_ALARM_DELAY_MINUTES = 0.5;
+let imageJobUpdateChain = Promise.resolve();
+let imageJobProcessing = false;
+const activeImagePersistenceJobs = new Map();
+
+function cloneImageJobUrls(imageUrls) {
+  if (!Array.isArray(imageUrls)) return [];
+  return imageUrls
+    .filter((entry) => entry && typeof entry.url === 'string')
+    .map((entry) => ({ ...entry }));
+}
+
+async function readImagePersistenceJobs() {
+  const result = await chrome.storage.local.get(IMAGE_JOB_QUEUE_KEY);
+  const jobs = result?.[IMAGE_JOB_QUEUE_KEY];
+  if (!jobs || typeof jobs !== 'object' || Array.isArray(jobs)) return {};
+
+  return Object.fromEntries(
+    Object.entries(jobs).filter(([, job]) => (
+      job
+      && typeof job.threadId === 'string'
+      && Array.isArray(job.imageUrls)
+    ))
+  );
+}
+
+async function writeImagePersistenceJobs(jobs) {
+  await chrome.storage.local.set({ [IMAGE_JOB_QUEUE_KEY]: jobs });
+}
+
+async function updateImagePersistenceJobs(updater) {
+  return runImagePersistenceExclusive(async () => {
+    const jobs = await readImagePersistenceJobs();
+    const nextJobs = await updater(jobs);
+    await writeImagePersistenceJobs(nextJobs);
+    return nextJobs;
+  });
+}
+
+async function runImagePersistenceExclusive(operation) {
+  const run = imageJobUpdateChain.then(() => operation());
+  imageJobUpdateChain = run.catch(() => {});
+  return run;
+}
+
+function scheduleImagePersistenceJobs() {
+  chrome.alarms.create(IMAGE_JOB_ALARM_NAME, { delayInMinutes: IMAGE_JOB_ALARM_DELAY_MINUTES });
+}
+
+function cancelActiveImagePersistenceJobs(threadId) {
+  const key = String(threadId);
+  for (const job of activeImagePersistenceJobs.values()) {
+    if (job.threadId === key) {
+      job.canceled = true;
+    }
+  }
+}
+
+function cancelAllActiveImagePersistenceJobs() {
+  for (const job of activeImagePersistenceJobs.values()) {
+    job.canceled = true;
+  }
+}
+
+function trackActiveImagePersistenceJob(job) {
+  const activeJob = {
+    jobId: job.jobId,
+    threadId: String(job.threadId),
+    canceled: false
+  };
+  activeImagePersistenceJobs.set(job.jobId, activeJob);
+  return activeJob;
+}
+
+function untrackActiveImagePersistenceJob(job) {
+  activeImagePersistenceJobs.delete(job.jobId);
+}
+
+async function enqueueImagePersistenceJob(threadId, imageUrls) {
+  const urls = cloneImageJobUrls(imageUrls);
+  if (urls.length === 0) return null;
+
+  const job = {
+    jobId: `${Date.now()}:${Math.random().toString(36).slice(2)}`,
+    threadId: String(threadId),
+    imageUrls: urls,
+    updatedAt: Date.now()
+  };
+
+  await updateImagePersistenceJobs((jobs) => {
+    cancelActiveImagePersistenceJobs(job.threadId);
+    return {
+      ...jobs,
+      [job.threadId]: job
+    };
+  });
+  scheduleImagePersistenceJobs();
+  return job;
+}
+
+async function removeImagePersistenceJob(threadId) {
+  const key = String(threadId);
+  await updateImagePersistenceJobs((jobs) => {
+    cancelActiveImagePersistenceJobs(key);
+    if (!jobs[key]) return jobs;
+    const nextJobs = { ...jobs };
+    delete nextJobs[key];
+    return nextJobs;
+  });
+}
+
+async function removeAllImagePersistenceJobs() {
+  await updateImagePersistenceJobs(() => {
+    cancelAllActiveImagePersistenceJobs();
+    return {};
+  });
+}
+
+async function isImagePersistenceJobCurrent(job) {
+  const jobs = await readImagePersistenceJobs();
+  const current = jobs[job.threadId];
+  return Boolean(current && current.jobId === job.jobId);
+}
+
+async function removeImagePersistenceJobIfCurrent(job) {
+  let removed = false;
+  await updateImagePersistenceJobs((jobs) => {
+    const current = jobs[job.threadId];
+    if (!current || current.jobId !== job.jobId) return jobs;
+    const nextJobs = { ...jobs };
+    delete nextJobs[job.threadId];
+    removed = true;
+    return nextJobs;
+  });
+  return removed;
+}
+
+async function commitImagePersistenceJobImages(job, items) {
+  if (!Array.isArray(items) || items.length === 0) return 0;
+  return runImagePersistenceExclusive(async () => {
+    const jobs = await readImagePersistenceJobs();
+    const current = jobs[job.threadId];
+    if (!current || current.jobId !== job.jobId) return 0;
+    return addImages(job.threadId, items, { replaceExisting: true });
+  });
+}
+
+async function processImagePersistenceJob(job) {
+  const activeJob = trackActiveImagePersistenceJob(job);
+  let imagesSaved = 0;
+  let error = null;
+
+  try {
+    if (activeJob.canceled || !(await isImagePersistenceJobCurrent(job))) return;
+
+    imagesSaved = await fetchAndStoreImages(job.threadId, job.imageUrls, {
+      precondition: () => !activeJob.canceled,
+      shouldStore: async () => !activeJob.canceled && await isImagePersistenceJobCurrent(job),
+      storeReadyImages: (items) => commitImagePersistenceJobImages(job, items)
+    });
+    if (imagesSaved <= 0) {
+      error = 'No images fetched successfully';
+    }
+  } catch (err) {
+    error = err?.message || String(err);
+  } finally {
+    untrackActiveImagePersistenceJob(job);
+  }
+
+  const removed = await removeImagePersistenceJobIfCurrent(job);
+  if (!removed) return;
+
+  if (error) {
+    console.warn('[XOE-SW] Queued image persistence failed:', job.threadId, error);
+    broadcastToExtension({ type: 'THREAD_IMAGES_FAILED', threadId: job.threadId, error });
+    return;
+  }
+
+  broadcastToExtension({ type: 'THREAD_IMAGES_READY', threadId: job.threadId, saved: imagesSaved });
+  console.log('[XOE-SW] Queued image persistence done:', job.threadId,
+              'imageUrls:', job.imageUrls.length, 'imagesSaved:', imagesSaved);
+}
+
+async function processPendingImagePersistenceJobs() {
+  if (imageJobProcessing) return;
+  imageJobProcessing = true;
+  try {
+    while (true) {
+      const jobs = await readImagePersistenceJobs();
+      const job = Object.values(jobs)
+        .sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0))[0];
+      if (!job) return;
+      await processImagePersistenceJob(job);
+    }
+  } finally {
+    imageJobProcessing = false;
+  }
+}
+
+async function schedulePendingImagePersistenceJobs() {
+  const jobs = await readImagePersistenceJobs();
+  if (Object.keys(jobs).length > 0) {
+    scheduleImagePersistenceJobs();
+  }
+}
+
+schedulePendingImagePersistenceJobs()
+  .catch((err) => console.warn('[XOE-SW] Image job resume scheduling failed:', err?.message || err));
+chrome.runtime.onStartup?.addListener?.(() => {
+  schedulePendingImagePersistenceJobs()
+    .catch((err) => console.warn('[XOE-SW] Startup image job scheduling failed:', err?.message || err));
+});
+chrome.runtime.onInstalled?.addListener?.(() => {
+  schedulePendingImagePersistenceJobs()
+    .catch((err) => console.warn('[XOE-SW] Install image job scheduling failed:', err?.message || err));
+});
+
 // ─── Side Panel Setup ───────────────────────────────────────
 
 if (chrome.sidePanel) {
@@ -206,6 +427,12 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     runCacheCleanup().catch((err) => console.error('[XOE-SW] Alarm cleanup error:', err));
   } else if (alarm.name === 'cache-cleanup-debounce') {
     runDebouncedCleanup().catch((err) => console.warn('[XOE-SW] Debounced alarm error:', err.message));
+  } else if (alarm.name === IMAGE_JOB_ALARM_NAME) {
+    try {
+      await processPendingImagePersistenceJobs();
+    } catch (err) {
+      console.warn('[XOE-SW] Image persistence alarm error:', err.message);
+    }
   } else if (alarm.name === 'offscreen-idle-close') {
     await closeOffscreenDocument();
   }
@@ -257,7 +484,8 @@ function scheduleOffscreenIdleClose() {
 const ALLOWED_ORIGINS = ['https://twitter.com', 'https://x.com', 'https://pro.x.com'];
 const BROADCAST_TYPES = new Set([
   'THREAD_SAVED', 'THREAD_DELETED', 'THREADS_DELETED', 'ALL_THREADS_DELETED',
-  'PDF_READY', 'CACHE_CLEANED', 'VIDEOS_SAVED'
+  'PDF_READY', 'CACHE_CLEANED', 'VIDEOS_SAVED',
+  'THREAD_IMAGES_READY', 'THREAD_IMAGES_FAILED'
 ]);
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -305,24 +533,34 @@ async function handleMessage(message, sender) {
       thread.timestamp = thread.timestamp || Date.now();
 
       const pendingImageUrls = Array.isArray(thread.imageUrls) ? thread.imageUrls : [];
-      let imagesSaved = 0;
+      const imageFetch = pendingImageUrls.length > 0 ? 'pending' : 'none';
 
-      await addThread(thread);
+      let queuedImageJob = null;
       if (pendingImageUrls.length > 0) {
-        imagesSaved = await fetchAndStoreImages(thread.id, pendingImageUrls);
-        if (imagesSaved > 0) {
-          broadcastToExtension({ type: 'THREAD_IMAGES_READY', threadId: thread.id, saved: imagesSaved });
+        queuedImageJob = await enqueueImagePersistenceJob(thread.id, pendingImageUrls);
+      } else {
+        await removeImagePersistenceJob(thread.id);
+      }
+      try {
+        await addThread(thread);
+        if (pendingImageUrls.length === 0) {
+          await deleteImagesForThread(thread.id);
         }
+      } catch (err) {
+        if (queuedImageJob) {
+          await removeImagePersistenceJobIfCurrent(queuedImageJob);
+        }
+        throw err;
       }
       console.log('[XOE-SW] Thread saved:', thread.id, 'tweets:', thread.tweets.length,
-                  'imageUrls:', pendingImageUrls.length, 'imagesSaved:', imagesSaved);
+                  'imageUrls:', pendingImageUrls.length, 'imageFetch:', imageFetch);
 
       if (sender.tab?.id) {
         chrome.tabs.sendMessage(sender.tab.id, {
           type: 'SAVE_COMPLETE', id: thread.id
         }).catch(() => {});
       }
-      broadcastToExtension({ type: 'THREAD_SAVED', threadId: thread.id, imagesSaved });
+      broadcastToExtension({ type: 'THREAD_SAVED', threadId: thread.id, imagesSaved: 0, imageFetch });
 
       // Debounced cleanup: collapse rapid saves into one run per minute.
       scheduleCleanup();
@@ -330,8 +568,8 @@ async function handleMessage(message, sender) {
       return {
         success: true,
         id: thread.id,
-        imagesSaved,
-        imageFetch: pendingImageUrls.length > 0 ? 'done' : 'none'
+        imagesSaved: 0,
+        imageFetch
       };
     }
 
@@ -339,6 +577,7 @@ async function handleMessage(message, sender) {
       if (!message.threadId || typeof message.threadId !== 'string') {
         throw new Error('Missing or invalid threadId');
       }
+      await removeImagePersistenceJob(message.threadId);
       await deleteThread(message.threadId);
       await deleteVideosByThread(message.threadId).catch(() => {});
       broadcastToExtension({ type: 'THREAD_DELETED', threadId: message.threadId });
@@ -347,6 +586,7 @@ async function handleMessage(message, sender) {
 
     case 'DELETE_ALL_THREADS': {
       if (sender.tab) throw new Error('DELETE_ALL not allowed from content script');
+      await removeAllImagePersistenceJobs();
       await deleteAllThreads();
       await deleteAllVideos().catch(() => {});
       broadcastToExtension({ type: 'ALL_THREADS_DELETED' });
@@ -683,6 +923,25 @@ async function fetchImageWithTimeout(url) {
   }
 }
 
+function isImageStorePreconditionMet(options) {
+  if (!options || typeof options.precondition !== 'function') return true;
+  try {
+    return options.precondition() !== false;
+  } catch {
+    return false;
+  }
+}
+
+async function shouldStoreFetchedImages(options) {
+  if (!isImageStorePreconditionMet(options)) return false;
+  if (!options || typeof options.shouldStore !== 'function') return true;
+  try {
+    return await options.shouldStore() !== false;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Fetch an array of image URLs in parallel (3-way semaphore), then persist
  * successful results as Blobs via addImages() in a single rw transaction.
@@ -691,14 +950,16 @@ async function fetchImageWithTimeout(url) {
  * index stored in image_blobs is a composite integer `tweetIdx * 10000 + imgIdx`
  * so offscreen/sidepanel can decode it back to tweet/image coordinates.
  */
-async function fetchAndStoreImages(threadId, imageUrls) {
+async function fetchAndStoreImages(threadId, imageUrls, options = {}) {
   if (!Array.isArray(imageUrls) || imageUrls.length === 0) return 0;
+  if (!isImageStorePreconditionMet(options)) return 0;
 
   const results = new Array(imageUrls.length);
   let cursor = 0;
 
   const worker = async () => {
     while (true) {
+      if (!isImageStorePreconditionMet(options)) return;
       const i = cursor++;
       if (i >= imageUrls.length) return;
       const entry = imageUrls[i];
@@ -709,6 +970,7 @@ async function fetchAndStoreImages(threadId, imageUrls) {
       }
       try {
         const blob = await fetchImageWithTimeout(entry.url);
+        if (!isImageStorePreconditionMet(options)) return;
         const tIdx = Number(entry.tweetIdx);
         const iIdx = Number(entry.imgIdx);
         const index = (Number.isFinite(tIdx) && Number.isFinite(iIdx))
@@ -726,17 +988,26 @@ async function fetchAndStoreImages(threadId, imageUrls) {
   };
 
   try {
+    if (!isImageStorePreconditionMet(options)) return 0;
     const pool = [];
     const n = Math.min(IMAGE_FETCH_CONCURRENCY, imageUrls.length);
     for (let i = 0; i < n; i++) pool.push(worker());
     await Promise.allSettled(pool);
 
     const ready = results.filter(Boolean);
+    if (!await shouldStoreFetchedImages(options)) {
+      console.log('[XOE-SW] Skipped stale image persistence job for', threadId);
+      return 0;
+    }
     if (ready.length === 0) {
       console.warn('[XOE-SW] No images fetched successfully for', threadId);
       return 0;
     }
-    const stored = await addImages(threadId, ready);
+    const stored = typeof options.storeReadyImages === 'function'
+      ? await options.storeReadyImages(ready)
+      : await addImages(threadId, ready, {
+        precondition: () => isImageStorePreconditionMet(options)
+      });
     console.log('[XOE-SW] Stored', stored, '/', imageUrls.length, 'images for', threadId);
     return stored;
   } catch (err) {

@@ -427,31 +427,29 @@
     const pending = tweets.filter((tweet) => tweet?.hasVideo && (!tweet.videoCandidates || tweet.videoCandidates.length === 0));
     if (pending.length === 0) return;
 
-    const pendingIds = new Set(pending.map((tweet) => tweet.id));
+    const pendingById = new Map(pending.map((tweet) => [String(tweet.id), tweet]));
+    const pendingIds = new Set(pendingById.keys());
     triggerPendingVideoLoads(pendingIds);
     const deadline = Date.now() + 3000;
 
     while (Date.now() < deadline) {
-      let updatedAny = false;
       document.querySelectorAll('article[data-testid="tweet"], article[role="article"]').forEach((articleEl) => {
         const tweetId = extractTweetId(articleEl);
-        if (!tweetId || !pendingIds.has(tweetId)) return;
+        if (!tweetId) return;
+        const target = pendingById.get(String(tweetId));
+        if (!target) return;
         const refreshed = extractTweetData(articleEl);
         if (!refreshed?.videoCandidates?.length) return;
-        const target = tweets.find((tweet) => tweet.id === tweetId);
-        if (!target) return;
         target.videoUrl = refreshed.videoUrl;
         target.videoMediaId = refreshed.videoMediaId;
         target.videoCandidates = refreshed.videoCandidates;
-        updatedAny = true;
+        pendingById.delete(String(tweetId));
       });
 
-      if (pending.every((tweet) => Array.isArray(tweet.videoCandidates) && tweet.videoCandidates.length > 0)) {
+      if (pendingById.size === 0) {
         return;
       }
-      if (!updatedAny) {
-        await new Promise((resolve) => setTimeout(resolve, 150));
-      }
+      await new Promise((resolve) => setTimeout(resolve, 150));
     }
   }
 

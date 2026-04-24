@@ -151,6 +151,40 @@ function loadBuildVideoEntriesHarness() {
   return context;
 }
 
+function loadEnrichPendingVideoTweetsHarness(overrides = {}) {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'content_script.js'), 'utf8');
+  const match = source.match(/function triggerPendingVideoLoads\(pendingIds\) \{[\s\S]*?\n  async function enrichPendingVideoTweets\(tweets\) \{[\s\S]*?\n  \}/);
+  if (!match) {
+    throw new Error('enrichPendingVideoTweets dependencies not found in content_script.js');
+  }
+
+  const timeValues = overrides.timeValues || [0, 1, 2, 3001];
+  const sleepCalls = [];
+  const context = {
+    document: {
+      querySelectorAll: overrides.querySelectorAll || (() => [])
+    },
+    Date: {
+      now: () => timeValues.length > 0 ? timeValues.shift() : 3001
+    },
+    setTimeout(resolve, delay) {
+      sleepCalls.push(delay);
+      resolve();
+      return sleepCalls.length;
+    },
+    Promise,
+    extractTweetId: overrides.extractTweetId || ((article) => article?.tweetId || ''),
+    extractTweetData: overrides.extractTweetData || ((article) => article?.tweet || null),
+    sleepCalls
+  };
+
+  vm.runInNewContext(
+    `${match[0]}; this.enrichPendingVideoTweets = enrichPendingVideoTweets;`,
+    context
+  );
+  return context;
+}
+
 function loadCollectThreadTweetsHarness() {
   const source = fs.readFileSync(path.join(__dirname, '..', 'content_script.js'), 'utf8');
   const match = source.match(/function collectThreadTweets\(rootArticle\) \{[\s\S]*?\n  \}/);
@@ -296,6 +330,54 @@ test('collectThreadTweets ignores nested role-only articles inside tweet cards',
   const tweets = collectThreadTweets(clickedArticle);
 
   assert.deepEqual(Array.from(tweets, (tweet) => tweet.id), ['100', '101']);
+});
+
+test('enrichPendingVideoTweets waits between scans even after updating one pending tweet', async () => {
+  const articleOne = {
+    tweetId: '100',
+    tweet: {
+      id: '100',
+      hasVideo: true,
+      videoUrl: 'https://video.twimg.com/ext_tw_video/100/pu/vid/640x360/clip.mp4',
+      videoMediaId: '100',
+      videoCandidates: ['https://video.twimg.com/ext_tw_video/100/pu/vid/640x360/clip.mp4']
+    },
+    querySelector() {
+      return null;
+    }
+  };
+  const articleTwo = {
+    tweetId: '101',
+    tweet: {
+      id: '101',
+      hasVideo: true,
+      videoUrl: null,
+      videoMediaId: null,
+      videoCandidates: []
+    },
+    querySelector() {
+      return null;
+    }
+  };
+  const harness = loadEnrichPendingVideoTweetsHarness({
+    querySelectorAll(selector) {
+      assert.equal(selector, 'article[data-testid="tweet"], article[role="article"]');
+      return [articleOne, articleTwo];
+    }
+  });
+  const tweets = [
+    { id: '100', hasVideo: true, videoUrl: null, videoMediaId: null, videoCandidates: [] },
+    { id: '101', hasVideo: true, videoUrl: null, videoMediaId: null, videoCandidates: [] }
+  ];
+
+  await harness.enrichPendingVideoTweets(tweets);
+
+  assert.deepEqual(tweets[0].videoCandidates, articleOne.tweet.videoCandidates);
+  assert.deepEqual(tweets[1].videoCandidates, []);
+  assert.ok(
+    harness.sleepCalls.includes(150),
+    'expected an inter-scan sleep while unresolved pending tweets remain'
+  );
 });
 
 test('injectButtons leaves articles retryable until the action bar exists', () => {
