@@ -74,8 +74,32 @@ chrome.runtime.onInstalled?.addListener?.(ensurePersistentStorage);
 
 // ─── Helpers ────────────────────────────────────────────────
 
+const ALLOWED_X_HOSTNAMES = new Set(['twitter.com', 'x.com', 'pro.x.com']);
+const CONTENT_SCRIPT_ALLOWED_MESSAGE_TYPES = new Set([
+  'SAVE_THREAD',
+  'FETCH_VIDEOS',
+  'GET_SAVED_IDS',
+  'CHECK_SAVED'
+]);
+
 function isXUrl(url) {
-  return url && (url.startsWith('https://twitter.com') || url.startsWith('https://x.com') || url.startsWith('https://pro.x.com'));
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' && ALLOWED_X_HOSTNAMES.has(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function assertContentScriptMessageAllowed(message, sender) {
+  if (!sender?.tab) return;
+  if (!isXUrl(sender.tab.url || '')) {
+    throw new Error('Unauthorized message origin');
+  }
+  if (!CONTENT_SCRIPT_ALLOWED_MESSAGE_TYPES.has(message.type)) {
+    throw new Error(`Content script message type not allowed: ${message.type}`);
+  }
 }
 
 // 永続保存を優先: 自動削除は無効 (0 = 無制限/無期限)。ユーザが明示的に
@@ -481,7 +505,6 @@ function scheduleOffscreenIdleClose() {
 
 // ─── Message Routing ────────────────────────────────────────
 
-const ALLOWED_ORIGINS = ['https://twitter.com', 'https://x.com', 'https://pro.x.com'];
 const BROADCAST_TYPES = new Set([
   'THREAD_SAVED', 'THREAD_DELETED', 'THREADS_DELETED', 'ALL_THREADS_DELETED',
   'PDF_READY', 'CACHE_CLEANED', 'VIDEOS_SAVED',
@@ -505,12 +528,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function handleMessage(message, sender) {
-  if (sender.tab) {
-    const tabUrl = sender.tab.url || '';
-    if (!ALLOWED_ORIGINS.some(o => tabUrl.startsWith(o))) {
-      throw new Error('Unauthorized origin');
-    }
-  }
+  assertContentScriptMessageAllowed(message, sender);
 
   switch (message.type) {
 
@@ -581,15 +599,16 @@ async function handleMessage(message, sender) {
       await deleteThread(message.threadId);
       await deleteVideosByThread(message.threadId).catch(() => {});
       broadcastToExtension({ type: 'THREAD_DELETED', threadId: message.threadId });
+      await broadcastToXTabs({ type: 'THREAD_DELETED', threadId: message.threadId });
       return { success: true };
     }
 
     case 'DELETE_ALL_THREADS': {
-      if (sender.tab) throw new Error('DELETE_ALL not allowed from content script');
       await removeAllImagePersistenceJobs();
       await deleteAllThreads();
       await deleteAllVideos().catch(() => {});
       broadcastToExtension({ type: 'ALL_THREADS_DELETED' });
+      await broadcastToXTabs({ type: 'ALL_THREADS_DELETED' });
       return { success: true };
     }
 
@@ -624,18 +643,11 @@ async function handleMessage(message, sender) {
     }
 
     case 'RUN_CLEANUP': {
-      if (sender.tab) throw new Error('RUN_CLEANUP not allowed from content script');
       const purged = await runCacheCleanup();
       return { success: true, purged };
     }
 
     case 'FETCH_VIDEOS': {
-      if (sender.tab) {
-        const tabUrl = sender.tab.url || '';
-        if (!ALLOWED_ORIGINS.some(o => tabUrl.startsWith(o))) {
-          throw new Error('Unauthorized origin');
-        }
-      }
       const { threadId, videoUrls } = message;
       if (!threadId || !Array.isArray(videoUrls)) {
         throw new Error('Invalid FETCH_VIDEOS params');

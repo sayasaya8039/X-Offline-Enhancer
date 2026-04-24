@@ -14,10 +14,10 @@ import {
   resolveVideoSrc
 } from './lib/reader-media.mjs';
 import {
-  getAllThreadsMeta, getThread, deleteThread, deleteAllThreads,
+  getAllThreadsMeta, getThread,
   searchThreads, getStorageSize,
   purgeExpiredCaches, purgeUntilUnderLimit,
-  getVideosByThread, deleteVideosByThread, deleteAllVideos,
+  getVideosByThread,
   getImagesForThread,
   exportAll, importAll
 } from './lib/db-esm.js';
@@ -228,6 +228,12 @@ function showConfirm(title, message) {
   });
 }
 
+async function sendRuntimeCommand(message) {
+  const response = await chrome.runtime.sendMessage(message);
+  if (response?.error) throw new Error(response.error);
+  return response;
+}
+
 // ─── Storage Display ────────────────────────────────────────
 
 async function updateStorageDisplay() {
@@ -380,14 +386,9 @@ async function deleteSelectedThreads() {
   if (!ok) return;
 
   const deletedIds = [...selectedIds];
-  // H7: parallel delete (was serial for-await)
   await Promise.all(deletedIds.map(id =>
-    Promise.all([
-      deleteThread(id),
-      deleteVideosByThread(id).catch(() => {})
-    ])
+    sendRuntimeCommand({ type: 'DELETE_THREAD', threadId: id })
   ));
-  chrome.runtime.sendMessage({ type: 'NOTIFY_THREADS_DELETED', threadIds: deletedIds }).catch(() => {});
   exitSelectionMode();
   loadThreadList(searchInput.value.trim());
   updateStorageDisplay();
@@ -878,11 +879,11 @@ threadListEl.addEventListener('click', (e) => {
     const id = deleteBtn.dataset.deleteId;
     showConfirm('スレッドを削除', 'このスレッドを削除しますか？この操作は元に戻せません。').then(ok => {
       if (ok) {
-        deleteThread(id).then(() => {
-          deleteVideosByThread(id).catch(() => {});
-          chrome.runtime.sendMessage({ type: 'NOTIFY_THREAD_DELETED', threadId: id }).catch(() => {});
+        sendRuntimeCommand({ type: 'DELETE_THREAD', threadId: id }).then(() => {
           removeThreadFromList(id);
           updateStorageDisplay();
+        }).catch((err) => {
+          console.error('[XOE] Delete thread failed:', err);
         });
       }
     });
@@ -903,12 +904,12 @@ btnSettings.addEventListener('click', () => {
 btnDeleteAll.addEventListener('click', () => {
   showConfirm('すべてのスレッドを削除', '保存済みのスレッドをすべて削除しますか？この操作は元に戻せません。').then(ok => {
     if (ok) {
-      deleteAllThreads().then(() => {
-        deleteAllVideos().catch(() => {});
-        chrome.runtime.sendMessage({ type: 'NOTIFY_ALL_DELETED' }).catch(() => {});
+      sendRuntimeCommand({ type: 'DELETE_ALL_THREADS' }).then(() => {
         if (selectionMode) exitSelectionMode();
         loadThreadList();
         updateStorageDisplay();
+      }).catch((err) => {
+        console.error('[XOE] Delete all threads failed:', err);
       });
     }
   });
@@ -927,10 +928,10 @@ btnDeleteThread.addEventListener('click', () => {
   showConfirm('スレッドを削除', 'このスレッドを削除しますか？この操作は元に戻せません。').then(ok => {
     if (ok) {
       const id = currentThreadId;
-      deleteThread(id).then(() => {
-        deleteVideosByThread(id).catch(() => {});
-        chrome.runtime.sendMessage({ type: 'NOTIFY_THREAD_DELETED', threadId: id }).catch(() => {});
+      sendRuntimeCommand({ type: 'DELETE_THREAD', threadId: id }).then(() => {
         closeReaderView();
+      }).catch((err) => {
+        console.error('[XOE] Delete reader thread failed:', err);
       });
     }
   });

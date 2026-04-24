@@ -33,6 +33,9 @@ function makeBlob(text, type = 'image/jpeg') {
 
 function loadHandleMessageHarness() {
   const source = fs.readFileSync(path.join(__dirname, '..', 'service_worker.js'), 'utf8');
+  const helperMatch = source.match(
+    /\/\/ ─── Helpers[\s\S]*?\n\/\/ 永続保存を優先/
+  );
   const queueMatch = source.match(
     /\/\/ ─── Image Persistence Queue[\s\S]*?\n\/\/ ─── Side Panel Setup/
   );
@@ -48,6 +51,9 @@ function loadHandleMessageHarness() {
   if (!match) {
     throw new Error('handleMessage not found in service_worker.js');
   }
+  if (!helperMatch) {
+    throw new Error('message helpers not found in service_worker.js');
+  }
   if (!alarmMatch) {
     throw new Error('alarm listener not found in service_worker.js');
   }
@@ -55,6 +61,7 @@ function loadHandleMessageHarness() {
     throw new Error('image fetch helpers not found in service_worker.js');
   }
 
+  const helperSource = helperMatch[0].replace(/\n\/\/ 永続保存を優先$/, '');
   const queueSource = queueMatch
     ? queueMatch[0].replace(/\n\/\/ ─── Side Panel Setup$/, '')
     : '';
@@ -70,11 +77,11 @@ function loadHandleMessageHarness() {
   let onAlarmListener = null;
   const storageData = {};
   const context = {
-    ALLOWED_ORIGINS: ['https://x.com', 'https://twitter.com', 'https://pro.x.com'],
     validateThreadForStorage(thread) {
       return { ok: true, integrity: { status: 'complete', totalTweets: thread?.tweets?.length || 0 } };
     },
     addThread: async () => {},
+    getSavedIds: async () => [],
     deleteThread: async (threadId) => {
       deletedThreads.push(threadId);
     },
@@ -91,6 +98,7 @@ function loadHandleMessageHarness() {
     },
     deleteVideosByThread: async () => {},
     deleteAllVideos: async () => {},
+    fetchAndStoreVideos: async () => 0,
     addImages: async (threadId, items, options = {}) => {
       if (options && typeof options.precondition === 'function' && !options.precondition()) {
         return 0;
@@ -115,6 +123,7 @@ function loadHandleMessageHarness() {
     broadcastToExtension(message) {
       events.push(message);
     },
+    broadcastToXTabs: async () => {},
     scheduleCleanup() {
       events.push({ type: 'cleanup-scheduled' });
     },
@@ -159,6 +168,9 @@ function loadHandleMessageHarness() {
         }
       },
       tabs: {
+        async query() {
+          return [];
+        },
         sendMessage() {
           return { catch() {} };
         }
@@ -172,7 +184,7 @@ function loadHandleMessageHarness() {
   };
 
   vm.runInNewContext(
-    `${queueSource}\n${alarmSource}\n${handleMessageSource}\n${imageFetchSource}; this.handleMessage = handleMessage; this.processPendingImagePersistenceJobs = typeof processPendingImagePersistenceJobs === 'function' ? processPendingImagePersistenceJobs : undefined;`,
+    `${helperSource}\n${queueSource}\n${alarmSource}\n${handleMessageSource}\n${imageFetchSource}; this.handleMessage = handleMessage; this.processPendingImagePersistenceJobs = typeof processPendingImagePersistenceJobs === 'function' ? processPendingImagePersistenceJobs : undefined;`,
     context
   );
   context.events = events;
@@ -912,6 +924,44 @@ test('DELETE_ALL_THREADS cancels all pending image jobs before deleting threads'
   assert.deepEqual(harness.fetchAttempts, []);
   assert.deepEqual(harness.storedImages, []);
   assert.ok(!harness.events.some((event) => event.type === 'THREAD_IMAGES_READY'));
+});
+
+test('content-script messages reject privileged message types', async () => {
+  for (const type of ['DELETE_THREAD', 'GET_THREAD', 'EXPORT_PDF']) {
+    const harness = loadHandleMessageHarness();
+    await assert.rejects(
+      harness.handleMessage(
+        { type, threadId: '1234567899' },
+        { tab: { id: 1, url: 'https://x.com/example/status/1234567899' } }
+      ),
+      new Error(`Content script message type not allowed: ${type}`)
+    );
+  }
+});
+
+test('content-script origin checks require exact X hostnames', async () => {
+  for (const url of [
+    'https://x.com.evil.test/example/status/1234567899',
+    'https://twitter.com.evil.test/example/status/1234567899'
+  ]) {
+    const harness = loadHandleMessageHarness();
+    await assert.rejects(
+      harness.handleMessage(
+        { type: 'FETCH_VIDEOS', threadId: '1234567899', videoUrls: [] },
+        { tab: { id: 1, url } }
+      ),
+      new Error('Unauthorized message origin')
+    );
+  }
+
+  const harness = loadHandleMessageHarness();
+  assert.deepEqual(
+    plain(await harness.handleMessage(
+      { type: 'FETCH_VIDEOS', threadId: '1234567899', videoUrls: [] },
+      { tab: { id: 1, url: 'https://x.com/example/status/1234567899' } }
+    )),
+    { success: true, saved: 0 }
+  );
 });
 
 test('image persistence alarm uses at least a 0.5 minute delay', async () => {
